@@ -1,0 +1,11 @@
+.env
+.env.tmp
+data/
+__pycache__/
+*.pyc
+content-zavod/
+.venv/
+venv/
+.env.*
+!.env.example
+*.log

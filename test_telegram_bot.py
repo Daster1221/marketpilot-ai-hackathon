@@ -1,0 +1,258 @@
+import json
+import io
+import tempfile
+import unittest
+import urllib.error
+from pathlib import Path
+from unittest.mock import patch
+
+import app
+import telegram_bot as bot
+
+
+class TelegramTests(unittest.TestCase):
+    def test_telegram_error_does_not_expose_token(self):
+        with patch.dict(app.os.environ, {'TELEGRAM_BOT_TOKEN': 'secret-token'}), patch.object(app, 'remote_json', side_effect=urllib.error.HTTPError('https://api.telegram.org/botsecret-token/getMe', 401, 'Unauthorized', {}, None)):
+            # Use the real adapter rather than the class-wide mock.
+            self.api.stop()
+            try:
+                with self.assertRaises(ValueError) as raised:
+                    bot.tg('getMe', {})
+                self.assertIn('TELEGRAM_BOT_TOKEN', str(raised.exception))
+                self.assertNotIn('secret-token', str(raised.exception))
+            finally:
+                self.api.start()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = patch.object(app, 'ROOT', Path(self.temp.name))
+        self.root.start()
+        (app.ROOT / 'data').mkdir()
+        bot.init_db()
+        self.api = patch.object(bot, 'tg', return_value={'message_id': 123})
+        self.api_mock = self.api.start()
+        self.env = patch.dict(app.os.environ, {'TELEGRAM_OWNER_ID': '42', 'TELEGRAM_CHANNEL_ID': '@test'})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.api.stop()
+        self.root.stop()
+        self.temp.cleanup()
+
+    def test_questionnaire_survives_reload(self):
+        bot.message(42, '/start')
+        answers = ['Кофейня в Уфе', 'Студенты', 'Мало обращений', 'С юмором', 'Не выдумывать цены']
+        for answer in answers:
+            bot.message(42, answer)
+        state = bot.session(42)
+        self.assertEqual(state['step'], len(bot.QUESTIONS))
+        self.assertEqual(json.loads(state['answers'])['style'], 'С юмором')
+        self.assertIn('Мало обращений', bot.brief(state))
+        self.assertEqual(bot.context(42)['mode'], 'review')
+        bot.callback(42, 'profile_ok')
+        self.assertEqual(bot.context(42), {})
+
+    def confirmation(self, post_id=1):
+        with app.db() as con:
+            row = con.execute('SELECT * FROM bot_confirmations WHERE post=?', (post_id,)).fetchone()
+        return f'confirm:{post_id}:{row["rev"]}:{row["nonce"]}'
+
+    def test_edit_revokes_approval_stale_buttons_and_duplicates(self):
+        with app.db() as con:
+            con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,"Тема","Первый текст","demo")')
+        with self.assertRaises(ValueError):
+            bot.callback(42, 'confirm:1:1:fake')
+        bot.callback(42, 'send:1:1')
+        old_confirmation = self.confirmation()
+        self.assertFalse(any(c.args[1].get('chat_id') == '@test' for c in self.api_mock.call_args_list if c.args[0] == 'sendMessage'))
+        bot.callback(42, 'edit:1:1')
+        with self.assertRaises(ValueError):
+            bot.callback(42, old_confirmation)
+        bot.callback(42, 'replace:1:1')
+        bot.message(42, 'Новый текст')
+        with self.assertRaises(ValueError):
+            bot.callback(42, old_confirmation)
+        with self.assertRaises(ValueError):
+            bot.callback(42, 'confirm:1:2:fake')
+        bot.callback(42, 'send:1:2')
+        confirmation = self.confirmation()
+        bot.callback(42, confirmation)
+        with self.assertRaises(ValueError):
+            bot.callback(42, confirmation)
+        sends = [c for c in self.api_mock.call_args_list if c.args[0] == 'sendMessage' and c.args[1]['chat_id'] == '@test']
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0].args[1]['text'], 'Новый текст')
+
+    def test_other_user_cannot_change_owner_data(self):
+        with patch.object(bot, 'message') as message:
+            bot.handle({'message': {'chat': {'id': 99, 'type': 'private'}, 'from': {'id': 99}, 'text': '/start'}})
+            message.assert_not_called()
+
+    def test_two_allowed_users_can_access_bot(self):
+        with patch.dict(app.os.environ, {'TELEGRAM_OWNER_ID': '8460400176,8071904711'}), patch.object(bot, 'message') as message:
+            for user_id in (8460400176, 8071904711):
+                bot.handle({'message': {'chat': {'id': user_id, 'type': 'private'}, 'from': {'id': user_id}, 'text': '/start'}})
+            self.assertEqual(message.call_count, 2)
+            message.assert_any_call(8460400176, '/start')
+            message.assert_any_call(8071904711, '/start')
+            bot.handle({'message': {'chat': {'id': 99, 'type': 'private'}, 'from': {'id': 99}, 'text': '/start'}})
+            self.assertEqual(message.call_count, 2)
+
+    def test_uncertain_delivery_cannot_repeat(self):
+        with app.db() as con:
+            con.execute('INSERT INTO bot_posts(chat,topic,body,source,status) VALUES(42,"Тема","Текст","demo","approved")')
+        bot.callback(42, 'send:1:1')
+        confirmation = self.confirmation()
+        with patch.object(bot, 'tg', side_effect=TimeoutError):
+            with self.assertRaises(ValueError):
+                bot.callback(42, confirmation)
+        with self.assertRaises(ValueError):
+            bot.callback(42, confirmation)
+        with app.db() as con:
+            self.assertEqual(con.execute('SELECT status FROM bot_posts').fetchone()['status'], 'delivery_unknown')
+
+    def test_cancel_and_restore_invalidate_old_buttons(self):
+        with app.db() as con:
+            con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,"Тема","Текст","demo")')
+        bot.callback(42, 'send:1:1')
+        old = self.confirmation()
+        bot.callback(42, 'cancel:1:1')
+        with self.assertRaises(ValueError):
+            bot.callback(42, old)
+        bot.callback(42, 'restore:1:2')
+        with app.db() as con:
+            post = con.execute('SELECT * FROM bot_posts').fetchone()
+        self.assertEqual((post['status'], post['rev']), ('draft', 3))
+
+    def test_channel_change_invalidates_confirmation(self):
+        with app.db() as con:
+            con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,"Тема","Текст","demo")')
+        bot.callback(42, 'send:1:1')
+        confirmation = self.confirmation()
+        with patch.dict(app.os.environ, {'TELEGRAM_CHANNEL_ID': '@different'}):
+            with self.assertRaises(ValueError):
+                bot.callback(42, confirmation)
+
+    def test_task_clarification_and_ai_rewrite(self):
+        bot.save({'chat': 42, 'step': 5, 'answers': '{"company":"Кофейня"}', 'editing': None})
+        posts = [{'topic': 'Анонс', 'body': 'Первый', 'image_prompt': ''}, {'topic': 'Напоминание', 'body': 'Второй', 'image_prompt': ''}]
+        with patch.object(app, 'prepare_posts', side_effect=[{'question': 'Когда и где?'}, {'posts': posts}]) as prepare:
+            bot.message(42, 'Два поста о турнире')
+            self.assertEqual(bot.context(42)['mode'], 'clarify')
+            bot.message(42, '15 ноября в спортзале')
+            self.assertEqual(prepare.call_args.args[2], '15 ноября в спортзале')
+        bot.callback(42, 'edit:2:1')
+        with patch.object(app, 'rewrite_post', return_value='Короткий второй') as rewrite:
+            bot.message(42, 'Сделай короче')
+            self.assertEqual(rewrite.call_args.args[1:], ('Второй', 'Сделай короче'))
+        with app.db() as con:
+            rows = con.execute('SELECT * FROM bot_posts ORDER BY id').fetchall()
+        self.assertEqual([p['body'] for p in rows], ['Первый', 'Короткий второй'])
+        self.assertEqual(rows[1]['rev'], 2)
+
+    def test_post_buttons_have_two_clear_rows(self):
+        with app.db() as con:
+            con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,"Тема","Текст","demo")')
+        bot.show_post(42, 1)
+        markup = self.api_mock.call_args.args[1]['reply_markup']['inline_keyboard']
+        self.assertEqual([len(row) for row in markup], [2, 1, 2])
+        self.assertEqual([button['callback_data'].split(':')[0] for row in markup for button in row], ['edit', 'cancel', 'send', 'history', 'posts'])
+
+    def test_four_edit_iterations_keep_history_and_original_task(self):
+        bot.save({'chat': 42, 'step': 5, 'answers': '{"company":"Компания"}', 'editing': None})
+        with patch.object(app, 'prepare_posts', return_value={'posts': [{'topic': 'Тема', 'body': '<b>Первый</b>', 'image_prompt': ''}]}):
+            bot.create_posts(42, 'Один пост о кофе', 'Без цен')
+        bot.callback(42, 'edit:1:1')
+        instructions = ['Обращайся на вы', 'Сократи', 'Добавь вопрос', 'Убери эмодзи']
+        with patch.object(app, 'rewrite_post', side_effect=['Версия 2', 'Версия 3', 'Версия 4', 'Версия 5']) as rewrite:
+            for i, instruction in enumerate(instructions):
+                bot.message(42, instruction)
+                self.assertEqual(bot.session(42)['editing'], 1)
+                sent_history = rewrite.call_args.kwargs['history']
+                self.assertEqual(len(sent_history), i + 1)
+                self.assertEqual([v['instruction'] for v in sent_history[1:]], instructions[:i])
+                self.assertEqual(rewrite.call_args.kwargs['task'], 'Один пост о кофе')
+                self.assertEqual(rewrite.call_args.kwargs['clarification'], 'Без цен')
+        bot.init_db()
+        history, origin = bot.post_memory(42, 1)
+        self.assertEqual(len(history), 5)
+        self.assertEqual(history[-1]['body'], 'Версия 5')
+        bot.callback(42, 'stop_edit')
+        self.assertIsNone(bot.session(42)['editing'])
+        bot.callback(42, 'edit:1:5')
+        with patch.object(app, 'rewrite_post', return_value='Версия 6') as rewrite:
+            bot.message(42, 'Верни подробности')
+            self.assertEqual(len(rewrite.call_args.kwargs['history']), 5)
+
+    def test_formatting_matches_card_preview_and_publication(self):
+        body = '<b>Важное</b> <i>слово</i>\n<blockquote>Настоящая цитата</blockquote>'
+        with app.db() as con:
+            con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,"Тема",?,"deepseek")', (body,))
+        bot.show_post(42, 1)
+        card = self.api_mock.call_args.args[1]
+        self.assertEqual(card['parse_mode'], 'HTML')
+        self.assertIn(body, card['text'])
+        bot.callback(42, 'send:1:1')
+        preview = self.api_mock.call_args.args[1]
+        self.assertEqual((preview['text'], preview['parse_mode']), (body, 'HTML'))
+        bot.callback(42, self.confirmation())
+        published = [c.args[1] for c in self.api_mock.call_args_list if c.args[0] == 'sendMessage' and c.args[1]['chat_id'] == '@test'][0]
+        self.assertEqual((published['text'], published['parse_mode']), (body, 'HTML'))
+
+    def test_other_user_cannot_open_post(self):
+        with app.db() as con:
+            con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,"Тема","Текст","demo")')
+        with self.assertRaises(ValueError):
+            bot.callback(99, 'send:1:1')
+
+    def test_voice_is_confirmed_before_it_becomes_a_task(self):
+        bot.save({'chat': 42, 'step': 5, 'answers': '{}', 'editing': None})
+        self.api_mock.return_value = {'file_path': 'voice/test.oga'}
+        response = io.BytesIO(b'test-audio')
+        with patch.object(app.urllib.request, 'urlopen', return_value=response), patch.object(bot.speech, 'transcribe', return_value='Два поста о кофе'), patch.dict(app.os.environ, {'TELEGRAM_BOT_TOKEN': 'test-token'}), patch.object(bot, 'message') as message:
+            bot.voice_message(42, {'file_id': 'voice-test', 'duration': 4, 'file_size': 10})
+            message.assert_not_called()
+            pending = bot.context(42)
+            bot.callback(42, 'speech:use:' + pending['nonce'])
+            message.assert_called_once_with(42, 'Два поста о кофе')
+            with self.assertRaises(ValueError):
+                bot.callback(42, 'speech:use:' + pending['nonce'])
+
+    def test_queue_saves_before_ack_and_does_not_replay(self):
+        update = {'update_id': 123, 'message': {'chat': {'id': 42}, 'text': 'test'}}
+        bot.enqueue(update)
+        bot.enqueue(update)
+        with app.db() as con:
+            self.assertEqual(con.execute('SELECT COUNT(*) FROM bot_inbox').fetchone()[0], 1)
+            self.assertEqual(con.execute('SELECT value FROM bot_meta WHERE key="offset"').fetchone()[0], 124)
+        with patch.object(bot, 'handle') as handle:
+            self.assertTrue(bot.consume_one(42))
+            self.assertFalse(bot.consume_one(42))
+            handle.assert_called_once()
+
+    def test_queue_failure_is_not_retried_automatically(self):
+        bot.enqueue({'update_id': 123, 'message': {'chat': {'id': 42}}})
+        with patch.object(bot, 'handle', side_effect=RuntimeError), patch('builtins.print'):
+            self.assertTrue(bot.consume_one(42))
+            self.assertFalse(bot.consume_one(42))
+        with app.db() as con:
+            self.assertEqual(con.execute('SELECT status FROM bot_inbox').fetchone()[0], 'failed')
+
+    def test_old_profile_is_migrated_without_losing_posts(self):
+        old = {'name': 'Компания', 'about': 'Стекло', 'site': 'https://example.com', 'audience': 'Сотрудники', 'problem': 'Нет времени', 'goal': 'Регулярность', 'style': 'Деловой', 'limits': 'Не выдумывать'}
+        with app.db() as con:
+            con.execute('DELETE FROM bot_meta WHERE key="form_version"')
+            con.execute('INSERT INTO bot_sessions VALUES(42,9,?,NULL)', (json.dumps(old),))
+            con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,"Тема","Текст","demo")')
+        bot.init_db()
+        state = bot.session(42)
+        self.assertEqual(state['step'], 5)
+        self.assertIn('Компания', bot.brief(state))
+        self.assertIn('Регулярность', bot.brief(state))
+        with app.db() as con:
+            self.assertEqual(con.execute('SELECT COUNT(*) FROM bot_posts').fetchone()[0], 1)
+
+
+if __name__ == '__main__':
+    unittest.main()
