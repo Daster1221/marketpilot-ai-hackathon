@@ -4,9 +4,43 @@ from unittest.mock import patch
 import app
 import editorial
 import post_format
+import editorial_voice
 
 
 class EditorialTests(unittest.TestCase):
+    def test_weekday_wish_does_not_require_year_even_after_repeated_answers(self):
+        body = '<b>Хорошего вторника, коллеги!</b>\nПусть рабочая неделя будет продуктивной.'
+        with patch.object(app, 'ai_json', return_value={'post': {'topic': 'Неделя', 'body': body}}):
+            for clarification in ('', 'Не спрашивай год', '2026\n2026'):
+                result = app.prepare_posts('Салаватстекло', 'Пожелай хорошей недели со вторника.', clarification)
+                self.assertEqual(result['status'], 'ready_for_review')
+                self.assertIn('вторника', result['posts'][0]['body'])
+
+    def test_author_supplied_relative_date_is_not_a_calendar_gap(self):
+        for word in ('Сегодня', 'Завтра', 'Вчера'):
+            body = '<b>' + word + ' встречаемся!</b>\nКоллеги, приходите.'
+            text, _ = editorial.clean_body(body, word + ' встреча коллег.')
+            self.assertIn(word, text)
+
+    def test_company_references_are_selected_and_isolated_from_sources(self):
+        response = {'post': {'topic': 'Матч', 'body': '<b>🏐 Играем вместе!</b>\n<aside>15 октября: волейбол.</aside>'}}
+        with patch.object(app, 'ai_json', return_value=response) as ai:
+            result = app.prepare_posts('Компания Салаватстекло', '15 октября играем в волейбол.')
+        system, data = ai.call_args.args
+        self.assertIn('style_reference_not_facts', system)
+        self.assertIn('Может оказаться, что человек', system)
+        self.assertNotIn('Может оказаться, что человек', str(data))
+        self.assertNotIn('🏐', result['posts'][0]['body'])
+        self.assertNotIn('ПЛС', result['posts'][0]['body'])
+        self.assertEqual(editorial_voice.company_instruction('Пекарня', 'Пост о хлебе'), '')
+
+    def test_editing_keeps_company_voice_and_unicode_emoji(self):
+        body = '<b>👩‍🔧 Наш коллега</b>\nИнтервью с сотрудником.'
+        with patch.object(app, 'ai_json', return_value={'body': body, 'memory': ''}) as ai:
+            result = app.rewrite_post('Салаватстекло', body, 'Сделай теплее')
+        self.assertIn('ПРОФИЛЬ КАНАЛА', ai.call_args.args[0])
+        self.assertNotIn('👩‍🔧', result['body'])
+
     def test_current_style_preserves_spoilers_tags_and_punctuation(self):
         body = '<b>Масленица!</b>\n\nКто придёт?\n<aside>9:00–13:00 — игры.</aside>\n<tg-spoiler>Сюрприз!</tg-spoiler>\n#Масленица #Уфа'
         text, notes = editorial.clean_body(body, 'Масленица, Уфа, игры с 9:00 до 13:00. Сюрприз!')
@@ -25,17 +59,17 @@ class EditorialTests(unittest.TestCase):
         self.assertEqual(ai.call_args.args[1]['count'], 1)
         self.assertEqual(result['approval_status'], 'draft')
         self.assertEqual(len(result['posts']), 1)
-        self.assertIn('САЛАВАТСТЕКЛО', result['posts'][0]['body'])
+        self.assertIn('Салаватстекло', result['posts'][0]['body'])
         self.assertNotIn('Проверить разрешение', result['posts'][0]['body'])
         self.assertTrue(result['posts'][0]['warnings'])
 
-    def test_emoji_removed_tags_preserved_and_markers_limited(self):
+    def test_emoji_preserved_tags_preserved_and_markers_limited(self):
         result, notes = editorial.clean_body('<b>Новость 😀</b>\n○ Данные\n\n○ Итог\n\n○ Лишний\n#Футбол #Уфа')
         self.assertNotIn('😀', result)
         self.assertIn('#Уфа', result)
         self.assertIn('#Футбол', result)
         self.assertLessEqual(result.count('○'), 2)
-        self.assertTrue(notes)
+        self.assertEqual(notes, [])
 
     def test_markers_are_not_list_bullets(self):
         result, _ = editorial.clean_body('○ Первый\n○ Второй\n○ Третий')
@@ -168,7 +202,7 @@ class EditorialTests(unittest.TestCase):
             result = app.rewrite_post('', 'Новость', 'Уточни стиль', memory='Коротко')
         self.assertIn(editorial.CORE_RULES, ai.call_args.args[0])
         self.assertNotIn('training_facts_only', ai.call_args.args[0])
-        self.assertNotIn('🎉', result['body'])
+        self.assertIn('🎉', result['body'])
         self.assertEqual(result['memory'], 'Коротко')
         self.assertIn('Проверить факты', result['warnings'])
 

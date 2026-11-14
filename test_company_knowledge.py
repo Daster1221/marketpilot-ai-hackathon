@@ -1,14 +1,52 @@
 import json
+import io
+import gzip
+from email.message import Message
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 import app
 import company_knowledge as knowledge
 import telegram_bot as bot
 
 
 class CompanyKnowledgeTests(unittest.TestCase):
+    def fetch_fixture(self, raw, encoding=''):
+        headers=Message()
+        headers['Content-Type']='text/html; charset=utf-8'
+        if encoding:
+            headers['Content-Encoding']=encoding
+        response=Mock()
+        response.headers=headers
+        response.read.side_effect=io.BytesIO(raw).read
+        response.geturl.return_value='https://company.ru/'
+        response.__enter__=Mock(return_value=response)
+        response.__exit__=Mock(return_value=False)
+        opener=Mock();opener.open.return_value=response
+        with patch.object(knowledge,'public_url',return_value='https://company.ru/'),patch.object(knowledge.urllib.request,'build_opener',return_value=opener):
+            result=knowledge.fetch('https://company.ru/')
+        return result,response
+
+    def test_large_html_extracts_text_after_large_script(self):
+        raw=('<html><script>'+('x'*1_200_000)+'</script><a href="/about">О компании</a><p>'+('Производим стекло в Уфе. '*20)+'</p></html>').encode()
+        result,_=self.fetch_fixture(raw)
+        self.assertIn('Производим стекло',result[1])
+        self.assertNotIn('xxxx',result[1])
+        self.assertIn('/about',result[2])
+
+    def test_gzip_pages_are_decoded_and_text_is_bounded(self):
+        raw=('<script>'+('x'*1_100_000)+'</script><p>'+('Компания производит стекло. '*2000)+'</p>').encode()
+        result,_=self.fetch_fixture(gzip.compress(raw),'gzip')
+        self.assertIn('Компания производит',result[1])
+        self.assertLessEqual(len(result[1]),knowledge.MAX_TEXT)
+
+    def test_oversized_page_keeps_already_found_facts(self):
+        raw=('<p>'+('Компания производит стекло. '*10)+'</p><script>'+('x'*8_100_000)).encode()
+        result,response=self.fetch_fixture(raw)
+        self.assertIn('Компания производит',result[1])
+        self.assertLessEqual(sum(call.args[0] for call in response.read.call_args_list),knowledge.MAX_PAGE_BYTES)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = patch.object(app, 'ROOT', Path(self.temp.name))

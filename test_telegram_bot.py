@@ -11,6 +11,28 @@ import telegram_bot as bot
 
 
 class TelegramTests(unittest.TestCase):
+    def test_post_list_pages_are_complete_scoped_and_remembered(self):
+        with app.db() as con:
+            for i in range(14):
+                con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,?,"Текст","demo")',(f'Пост {i}',))
+            con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(99,"Чужой пост","Текст","demo")')
+        seen=set()
+        with patch.object(bot,'say') as show:
+            for page in range(3):
+                bot.callback(42,f'posts_page:{page}')
+                rows=show.call_args.kwargs['inline']
+                ids=[b['callback_data'].split(':')[1] for row in rows for b in row if b['callback_data'].startswith('view:')]
+                self.assertLessEqual(len(ids),6)
+                self.assertFalse(seen.intersection(ids))
+                seen.update(ids)
+            bot.list_posts(42)
+            self.assertIn('3/3',show.call_args.args[1])
+        self.assertEqual(len(seen),14)
+
+    def test_create_button_is_green_and_menu_has_no_house(self):
+        self.assertEqual(bot.btn('✨ Создать пост','new'),{'text':'Создать пост','callback_data':'new','style':'success'})
+        self.assertEqual(bot.btn('⌂ В меню','home')['text'],'В меню')
+
     def test_followup_to_open_draft_edits_that_post_instead_of_replanning(self):
         bot.save({'chat': 42, 'step': 5, 'answers': '{}', 'editing': None})
         with app.db() as con:
@@ -113,7 +135,7 @@ class TelegramTests(unittest.TestCase):
         with patch.object(bot, 'say') as show:
             bot.home(42)
         rows = show.call_args.kwargs['inline']
-        self.assertEqual([len(row) for row in rows], [1, 2, 2, 1])
+        self.assertEqual([len(row) for row in rows], [1, 2, 2, 1, 1])
         self.assertEqual(rows[0][0]['callback_data'], 'new')
         self.assertEqual(rows[-1][0]['style'], 'primary')
         with patch.object(bot, 'say') as show:
@@ -336,8 +358,9 @@ class TelegramTests(unittest.TestCase):
             con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,"Тема","Текст","demo")')
         bot.show_post(42, 1)
         markup = self.api_mock.call_args.args[1]['reply_markup']['inline_keyboard']
-        self.assertEqual([len(row) for row in markup], [2, 1, 2])
-        self.assertEqual([button['callback_data'].split(':')[0] for row in markup for button in row], ['edit', 'cancel', 'send', 'history', 'posts'])
+        self.assertEqual([len(row) for row in markup], [2, 1, 1, 2, 1, 2, 1])
+        self.assertIn("запланировать", markup[2][0]["text"])
+        self.assertEqual([button['callback_data'].split(':')[0] for row in markup for button in row], ['edit', 'cancel', 'send', 'schedule', 'history', 'posts', 'feat_art', 'feat_photo_help', 'feat_image_remove', 'feat_delete'])
 
     def test_four_edit_iterations_use_only_temporary_compact_memory(self):
         bot.save({'chat': 42, 'step': 5, 'answers': '{"company":"Компания"}', 'editing': None})
@@ -351,7 +374,7 @@ class TelegramTests(unittest.TestCase):
             for i, instruction in enumerate(instructions):
                 bot.message(42, instruction)
                 self.assertEqual(bot.session(42)['editing'], 1)
-                self.assertEqual(rewrite.call_args.kwargs, {'memory': summaries[i - 1] if i else '', 'brand_name_mode': 'brandbook', 'publication_date': None})
+                self.assertEqual(rewrite.call_args.kwargs, {'memory': summaries[i - 1] if i else '', 'brand_name_mode': 'editorial', 'publication_date': None})
                 self.assertEqual(bot.context(42)['memory'], summaries[i])
         bot.init_db()
         history, origin = bot.post_memory(42, 1)
@@ -364,7 +387,7 @@ class TelegramTests(unittest.TestCase):
         bot.callback(42, 'edit:1:5')
         with patch.object(app, 'rewrite_post', return_value={'body': 'Версия 6', 'memory': 'Подробно'}) as rewrite:
             bot.message(42, 'Верни подробности')
-            self.assertEqual(rewrite.call_args.kwargs, {'memory': '', 'brand_name_mode': 'brandbook', 'publication_date': None})
+            self.assertEqual(rewrite.call_args.kwargs, {'memory': '', 'brand_name_mode': 'editorial', 'publication_date': None})
 
     def test_cancelling_post_clears_edit_memory(self):
         bot.save({'chat': 42, 'step': 5, 'answers': '{}', 'editing': 1})

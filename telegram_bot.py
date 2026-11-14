@@ -16,6 +16,7 @@ import editorial
 import telegram_screen
 import bot_stages
 import company_knowledge
+import bot_features
 from html import escape
 
 QUESTIONS = [
@@ -50,6 +51,11 @@ def clarification_screen(chat, question):
 
 
 def btn(text, data, style=None):
+    text = re.sub(r'^[\s✨🗂🏢❔⚙️✏🗑📤🕘📝✅⌂✓✕↻]+', '', text)
+    if data == 'home':
+        text = 'В меню'
+    if data == 'new' or data.startswith('plan_draft:'):
+        text, style = 'Создать пост', 'success'
     value = {'text': text, 'callback_data': data}
     if style:
         value['style'] = style
@@ -108,6 +114,8 @@ def init_db():
         telegram_screen.init_db(con)
         bot_stages.init_db(con)
         company_knowledge.init_db(con)
+        bot_features.init_db(con)
+        con.execute('CREATE TABLE IF NOT EXISTS bot_list_positions (chat INTEGER PRIMARY KEY, page INTEGER)')
         con.execute('CREATE TABLE IF NOT EXISTS bot_post_focus (chat INTEGER PRIMARY KEY, post INTEGER, rev INTEGER)')
         con.execute('CREATE TABLE IF NOT EXISTS bot_sessions (chat INTEGER PRIMARY KEY, step INTEGER, answers TEXT, editing INTEGER)')
         con.execute('CREATE TABLE IF NOT EXISTS bot_posts (id INTEGER PRIMARY KEY, chat INTEGER, topic TEXT, body TEXT, image_prompt TEXT, source TEXT, status TEXT DEFAULT "draft", rev INTEGER DEFAULT 1, message_id TEXT)')
@@ -131,12 +139,18 @@ def init_db():
             con.execute('INSERT INTO bot_meta VALUES("form_version",2)')
         con.execute('UPDATE bot_posts SET status="delivery_unknown" WHERE status="publishing"')
         con.execute('INSERT OR IGNORE INTO bot_versions(post,rev,body,instruction,kind) SELECT id,rev,body,"","initial" FROM bot_posts')
+        con.execute('CREATE INDEX IF NOT EXISTS bot_posts_chat_id ON bot_posts(chat,id)')
+        con.execute('CREATE INDEX IF NOT EXISTS bot_inbox_chat_status ON bot_inbox(chat,status,id)')
 
 
 class TelegramAPIError(ValueError):
     def __init__(self, message, reason='other'):
         super().__init__(message)
         self.reason = reason
+
+
+class TelegramConnectionError(ValueError):
+    """Temporary transport failure; safe to retry read-only startup checks."""
 
 
 def tg(method, payload, timeout=None):
@@ -152,6 +166,7 @@ def tg(method, payload, timeout=None):
     except urllib.error.HTTPError as error:
         status = error.code
         reason = 'other'
+        description=''
         try:
             description = str(json.loads(error.read(10000)).get('description', '')).lower()
             if 'message is not modified' in description:
@@ -162,11 +177,20 @@ def tg(method, payload, timeout=None):
                 reason = 'formatting'
             elif 'button_data_invalid' in description:
                 reason = 'button'
-            elif 'chat not found' in description:
+            elif any(value in description for value in ('chat not found','user not found','user_id_invalid')):
                 reason = 'chat_not_found'
         except Exception:
             pass
         error.close()
+        if status==400 and 'emoji' in description and '<tg-emoji' in json.dumps(payload,ensure_ascii=False):
+            import premium_emoji
+            fallback=dict(payload)
+            for field in ('text','caption'):
+                if isinstance(fallback.get(field),str):fallback[field]=premium_emoji.remove_emoji(fallback[field])
+            if isinstance(fallback.get('media'),dict):
+                fallback['media']=dict(fallback['media'])
+                if isinstance(fallback['media'].get('caption'),str):fallback['media']['caption']=premium_emoji.remove_emoji(fallback['media']['caption'])
+            if fallback!=payload:return tg(method,fallback,timeout=timeout)
         messages = {401: 'Telegram не принял TELEGRAM_BOT_TOKEN. Проверьте токен от BotFather.',
                     409: 'Конфликт Telegram: остановите второй экземпляр бота с этим токеном.',
                     403: 'Telegram запретил действие. Проверьте доступ бота к чату и права публикации.',
@@ -186,7 +210,7 @@ def tg(method, payload, timeout=None):
         print(f'Telegram API: {method}, HTTP {status}, reason={reason}')
         raise TelegramAPIError(message, reason) from None
     except (urllib.error.URLError, TimeoutError):
-        raise ValueError('Нет соединения с Telegram. Проверьте интернет и доступ к api.telegram.org.') from None
+        raise TelegramConnectionError('Нет соединения с Telegram. Проверьте интернет и доступ к api.telegram.org.') from None
     if not result.get('ok'):
         raise RuntimeError('Telegram отклонил запрос')
     return result['result']
@@ -199,11 +223,17 @@ def stage_header(chat, stage):
         print('Stage banner unavailable; text interface remains usable.')
 
 
-def say(chat, text, options=None, inline=None, formatted=False, stage=None):
+def say(chat, text, options=None, inline=None, formatted=False, stage=None, media=''):
+    if formatted:
+        import premium_emoji
+        text=premium_emoji.render_private(text,chat)
     buttons = inline if inline is not None else [[btn('⌂ В меню', 'home')]]
     with telegram_screen.chat_lock(chat):
-        stage_header(chat, stage)
-        return telegram_screen.show(chat, text, buttons, formatted, tg)
+        stage_header(chat, None)
+        path = app.ROOT / 'assets' / 'stages' / (str(stage) + '.png')
+        # Decorative banners must not shorten a full draft to a photo caption.
+        picture = media or (str(path) if stage and path.is_file() and post_format.length(text)<=950 else '')
+        return telegram_screen.show(chat, text, buttons, formatted, tg, media=picture)
 
 
 def session(chat):
@@ -283,17 +313,28 @@ def show_post(chat, post_id):
     def button(title, command):
         return btn(title, f'{command}:{post_id}:{post["rev"]}')
     if post['status'] in ('draft', 'approved'):
-        buttons = [[button('✏️ Изменить', 'edit'), button('🗑 Отменить', 'cancel')], [button('📤 Отправить', 'send')]]
+        buttons = [[button('Изменить текст', 'edit'), button('🗑 Отменить', 'cancel')], [{**button('📤 Отправить', 'send'), 'style': 'primary'}]]
     elif post['status'] == 'cancelled':
         buttons = [[button('↩️ Восстановить', 'restore')]]
+    if post['status'] in ('draft','approved'):
+        with app.db() as con:
+            delivery=con.execute('SELECT * FROM bot_delivery_schedule WHERE post=?',(post_id,)).fetchone()
+        if delivery and delivery['state']=='queued' and delivery['rev']==post['rev']:
+            buttons.append([button('Снять с расписания','unschedule')])
+        else:buttons.append([button('Согласовать и запланировать','schedule')])
     if session(chat)['editing'] == post_id:
         buttons.append([btn('✓ Готово', 'stop_edit')])
     if review['warnings']:
         buttons.append([button(f'Заметки ({len(review["warnings"])})', 'notes')])
     buttons.append([button('🕘 История правок', 'history'), btn('← К списку', 'posts')])
+    if post['status'] in ('draft', 'approved'):
+        buttons.append([button('Изменить изображение','feat_art')])
+        buttons.append([btn('Прикрепить фото', 'feat_photo_help'), btn('Убрать фото', f'feat_image_remove:{post_id}:{post["rev"]}')])
+    if post['status'] not in ('publishing','delivery_unknown'):
+        buttons.append([btn('Удалить из моих постов', f'feat_delete:{post_id}:{post["rev"]}')])
     body = post_format.normalize(post['body'])
     stage = 'published' if post['status'] == 'published' else ('edit' if session(chat)['editing'] == post_id else 'draft')
-    return say(chat, body, inline=buttons, formatted=True, stage=stage)
+    return say(chat, body, inline=buttons, formatted=True, stage=stage, media=bot_features.image_for(post_id))
 
 
 def post_memory(chat, post_id):
@@ -313,15 +354,26 @@ def review_metadata(post_id):
     return {'warnings': json.loads(row['warnings']), 'brand_name_mode': row['brand_name_mode'], 'publication_date': row['publication_date'], 'fact_blocks': json.loads(row['fact_blocks'])} if row else {'warnings': [], 'brand_name_mode': editorial.brand_mode(), 'publication_date': None, 'fact_blocks': []}
 
 
-def list_posts(chat):
+def list_posts(chat, page=None):
     with app.db() as con:
-        posts = con.execute('SELECT * FROM bot_posts WHERE chat=? ORDER BY id DESC LIMIT 12', (chat,)).fetchall()
+        count = con.execute('SELECT COUNT(*) FROM bot_posts WHERE chat=?', (chat,)).fetchone()[0]
+        saved = con.execute('SELECT page FROM bot_list_positions WHERE chat=?', (chat,)).fetchone()
+        pages = max(1, (count + 5) // 6)
+        page = min(max(0, int(page if page is not None else (saved['page'] if saved else 0))), pages - 1)
+        posts = con.execute('SELECT * FROM bot_posts WHERE chat=? ORDER BY id DESC LIMIT 6 OFFSET ?', (chat, page * 6)).fetchall()
+        con.execute('INSERT OR REPLACE INTO bot_list_positions VALUES(?,?)', (chat, page))
     if not posts:
         return say(chat, 'Пока пусто.', inline=[[btn('✨ Создать пост', 'new')]])
-    markers = {'draft': '📝', 'approved': '📝', 'published': '✅', 'cancelled': '🗑', 'delivery_unknown': '⚠️', 'publishing': '⏳'}
-    buttons = [[btn(f'{markers[p["status"]]} №{p["id"]} · {p["topic"][:32]}', f'view:{p["id"]}:{p["rev"]}')] for p in posts]
+    buttons = [[btn(f'№{p["id"]} · {p["topic"][:40]}', f'view:{p["id"]}:{p["rev"]}')] for p in posts]
+    nav = []
+    if page:
+        nav.append(btn('← Назад', f'posts_page:{page - 1}'))
+    if page + 1 < pages:
+        nav.append(btn('Далее →', f'posts_page:{page + 1}'))
+    if nav:
+        buttons.append(nav)
     buttons.append([btn('✨ Новый пост', 'new'), btn('⌂ В меню', 'home')])
-    return say(chat, 'Выберите пост', inline=buttons)
+    return say(chat, f'Мои посты · {page + 1}/{pages}\nВыберите публикацию', inline=buttons)
 
 
 def preview(chat, post):
@@ -334,14 +386,43 @@ def preview(chat, post):
     nonce = secrets.token_hex(5)
     with app.db() as con:
         con.execute('INSERT OR REPLACE INTO bot_confirmations VALUES(?,?,?,?,?)', (post['id'], chat, post['rev'], channel, nonce))
+    if not bot_features.preferences(chat)['confirm_publish']:
+        return callback(chat, f'confirm:{post["id"]}:{post["rev"]}:{nonce}')
     heading = f'Отправить в «{destination.get("title", channel)}»?\n{channel}'
+    if bot_features.image_for(post['id']) and post_format.length(post['body']) > 1000:
+        heading += '\nФото с началом поста и продолжение отдельным сообщением.'
     notes = review_metadata(post['id'])['warnings']
     if notes:
         heading += '\n\nПроверить редактору:\n' + '\n'.join('- ' + note for note in notes)
-    say(chat, escape(heading) + '\n\n' + post_format.normalize(post['body']), inline=[[btn('✅ Подтвердить отправку', f'confirm:{post["id"]}:{post["rev"]}:{nonce}')], [btn('← Назад к посту', f'view:{post["id"]}:{post["rev"]}')]], formatted=True, stage='review')
+    say(chat, escape(heading) + '\n\n' + post_format.normalize(post['body']), inline=[[btn('✅ Подтвердить отправку', f'confirm:{post["id"]}:{post["rev"]}:{nonce}')], [btn('← Назад к посту', f'view:{post["id"]}:{post["rev"]}')]], formatted=True, stage='review', media=bot_features.image_for(post['id']))
 
 
 def callback(chat, data):
+    if context(chat).get('mode')=='emoji_palette' and not data.startswith('feat_emoji'):
+        set_context(chat,context(chat).get('previous',{}))
+    if context(chat).get('mode')=='schedule' and (data.startswith('view:') or data=='home'):set_context(chat,{})
+    if data.startswith(('schedule:', 'unschedule:')):
+        import scheduling
+        command,pid,rev=data.split(':');pid,rev=int(pid),int(rev)
+        if command=='unschedule':
+            scheduling.cancel(chat,pid,rev);return show_post(chat,pid)
+        with app.db() as con:
+            p=con.execute('SELECT * FROM bot_posts WHERE id=? AND chat=?',(pid,chat)).fetchone()
+        if not p or p['rev']!=rev or p['status'] not in ('draft','approved'):raise ValueError('Откройте актуальный черновик.')
+        set_context(chat,{'mode':'schedule','post':pid,'rev':rev})
+        return say(chat,'Согласовать пост и отправить по времени? Пришлите дату и время по Уфе (UTC+5), например: 15.11.2026 18:30. Отправка даты подтвердит публикацию.',inline=[[btn('Не планировать',f'view:{pid}:{rev}')]])
+    if data.startswith('posts_page:'):
+        value = data.split(':', 1)[1]
+        if not value.isdecimal() or len(value) > 8:
+            raise ValueError('Откройте список постов заново.')
+        return list_posts(chat, int(value))
+    if data == 'feat_photo_help':
+        post = focused_post(chat)
+        if not post:
+            raise ValueError('Сначала откройте черновик.')
+        return say(chat, 'Пришлите фото обычным сообщением. Оно прикрепится к открытому черновику.', inline=[[btn('← К посту', f'view:{post["id"]}:{post["rev"]}')]])
+    if data.startswith('feat_'):
+        return bot_features.callback(chat, data)
     if data.startswith('plan_'):
         return plan_callback(chat, data)
     if data == 'tg_app':
@@ -430,10 +511,20 @@ def callback(chat, data):
             if post_format.length(post['body']) > editorial.MAX_TELEGRAM_UNITS:
                 raise ValueError('Текст превышает предел одного сообщения Telegram. Сократите его перед отправкой.')
             con.execute('DELETE FROM bot_confirmations WHERE post=?', (post['id'],))
-            con.execute('UPDATE bot_posts SET status="publishing" WHERE id=?', (post['id'],))
+            changed=con.execute('UPDATE bot_posts SET status="publishing" WHERE id=? AND rev=? AND status IN ("draft","approved")', (post['id'],post['rev'])).rowcount
+            if not changed:raise ValueError('Отправка уже началась. Повтор запрещён.')
             con.commit()
             try:
-                result = tg('sendMessage', {'chat_id': channel, 'text': post_format.normalize(post['body']), 'parse_mode': 'HTML'})
+                image = bot_features.image_for(post['id'])
+                if image:
+                    import premium_emoji
+                    pages = post_format.split_pages(premium_emoji.remove_emoji(post['body']), limit=1000, formatted=True)
+                    result = tg('sendPhoto', {'chat_id': channel, **__import__('post_images').payload(image), 'caption': pages[0], 'parse_mode': 'HTML'})
+                    for page in pages[1:]:
+                        tg('sendMessage', {'chat_id': channel, 'text': page, 'parse_mode': 'HTML'})
+                else:
+                    import premium_emoji
+                    result = tg('sendMessage', {'chat_id': channel, 'text': premium_emoji.remove_emoji(post_format.normalize(post['body'])), 'parse_mode': 'HTML'})
             except Exception:
                 con.execute('UPDATE bot_posts SET status="delivery_unknown" WHERE id=?', (post['id'],))
                 con.commit()
@@ -449,7 +540,7 @@ def home(chat):
     rows = [[btn('✨ Создать пост', 'new')],
             [btn('🗂 Мои посты', 'posts'), btn('🏢 Компания', 'profile')],
             [btn('⚙️ Настройки', 'settings'), btn('❔ Помощь', 'help')],
-            [btn('ТГ-приложение', 'tg_app', style='primary')]]
+            [btn('Контент-план', 'feat_plan')], [btn('ТГ-приложение', 'tg_app', style='primary')]]
     if context(chat).get('mode') in ('task', 'planning', 'plan_retry') or context(chat).get('retry_instruction'):
         if not is_busy(chat):
             rows.insert(0, [btn('↻ Повторить задачу', 'retry')])
@@ -459,13 +550,12 @@ def home(chat):
         rows.insert(0, [btn('Голосовое готово', 'voice_show')])
     if context(chat).get('mode') in ('plan_facts', 'plan_ideas', 'plan_clarify', 'plan_correct'):
         rows.insert(1, [btn('Продолжить публикацию', 'plan_resume')])
-    text = ('<b>Привет! Я — Салаватстекло Бот.</b>\n\n'
-            'Помогаю превращать ваши новости в готовые посты для Telegram.\n\n'
-            '— Принимаю задачи текстом и голосом.\n'
-            '— Пишу и оформляю черновики с учётом компании.\n'
-            '— Вношу правки и сохраняю ваши посты.\n\n'
-            '<b>Публикую только после вашего подтверждения.</b>\n'
-            'Начнём? Нажмите «Создать пост».' )
+    text = ('<b>Ваш AI-редактор</b>\n\n'
+            'Превратим идею в публикацию. Расскажите о событии текстом или голосом, добавьте своё фото.\n\n'
+            '<b>Посты</b> · тексты, оформление и правки\n'
+            '<b>Контент-план</b> · темы на нужный период\n'
+            '<b>Компания</b> · профиль и знания с сайта\n\n'
+            'Режим: <b>' + ('Быстрый' if bot_features.preferences(chat)['fast'] else 'Подробный') + '</b>')
     if is_busy(chat):
         text += '\n\nЗадача в работе.'
     say(chat, text, inline=rows, formatted=True, stage='home')
@@ -494,8 +584,7 @@ def navigation(chat, data):
         if 'reset_nonce' in pending:
             pending.pop('reset_nonce')
             set_context(chat, pending)
-        return say(chat, '<b>Настройки</b>\n\nСброс компании очистит анкету и текущую задачу. Сохранённые посты останутся в «Мои посты».',
-                   inline=[[btn('Сбросить компанию', 'company_reset', style='danger')], [btn('← В меню', 'home')]], formatted=True)
+        return bot_features.settings(chat)
     if data == 'company_reset':
         if state['editing']:
             return say(chat, 'Сначала завершите правки поста.', inline=[[btn('← К правкам', 'stop_edit')]])
@@ -512,6 +601,8 @@ def navigation(chat, data):
             con.execute('DELETE FROM bot_confirmations WHERE chat=?', (chat,))
             con.execute('DELETE FROM bot_post_focus WHERE chat=?', (chat,))
             con.execute('DELETE FROM bot_company_knowledge WHERE chat=?', (chat,))
+            con.execute('DELETE FROM bot_content_plans WHERE chat=?', (chat,))
+            con.execute('DELETE FROM bot_feature_confirmations WHERE chat=?', (chat,))
         return ask(session(chat))
     if data.startswith('voice_'):
         if pending.get('mode') != 'voice':
@@ -615,6 +706,8 @@ def answer_question(state, text):
     answers = json.loads(state['answers'])
     if state['step'] == 0:
         company_knowledge.clear(state['chat'])
+        with app.db() as con:
+            con.execute('DELETE FROM bot_content_plans WHERE chat=?', (state['chat'],))
         answers.pop('site', None)
     answers[QUESTIONS[state['step']][0]] = text
     state['answers'] = json.dumps(answers, ensure_ascii=False)
@@ -726,6 +819,9 @@ def create_posts(chat, task, clarification='', *, angle=''):
             remember_version(con, cursor.lastrowid, 1, post['body'])
             con.execute('INSERT INTO bot_post_context VALUES(?,?,?,?)', (cursor.lastrowid, profile, task, clarification))
             con.execute('INSERT INTO bot_post_review(post,warnings,brand_name_mode,publication_date,fact_blocks) VALUES(?,?,?,?,?)', (cursor.lastrowid, json.dumps(post.get('warnings', []), ensure_ascii=False), post.get('brand_name_mode', editorial.brand_mode()), post.get('publication_date'), json.dumps(post.get('fact_blocks', []), ensure_ascii=False)))
+    import post_images, contextlib
+    with (loading(chat, 'Создаю изображение') if wait.visible else contextlib.nullcontext(wait)) as wait:
+        post_images.attach_many(chat, ids, profile, task+'\n'+clarification)
     set_context(chat, {})
     rows = []
     with app.db() as con:
@@ -743,7 +839,29 @@ def message(chat, text):
     with app.db() as con:
         con.execute('DELETE FROM bot_confirmations WHERE chat=?', (chat,))
     state = session(chat)
+    deep_link = re.fullmatch(r'/start\s+post_(\d+)', text)
+    if deep_link:
+        with app.db() as con:
+            linked = con.execute('SELECT id,rev FROM bot_posts WHERE id=? AND chat=?',(int(deep_link[1]),chat)).fetchone()
+        if not linked:
+            raise ValueError('Пост не найден.')
+        return callback(chat, f'view:{linked["id"]}:{linked["rev"]}')
     pending = context(chat)
+    if pending.get('mode')=='image_edit' and not text.startswith('/'):
+        import post_images
+        with loading(chat,'Создаю новый вариант изображения') as wait:
+            post_images.regenerate(chat,pending['post'],pending['rev'],text,pending['nonce'])
+        previous=pending.get('previous',{})
+        with app.db() as con:updated=con.execute('SELECT rev FROM bot_posts WHERE id=? AND chat=?',(pending['post'],chat)).fetchone()
+        if previous.get('mode')=='edit':previous['rev']=updated['rev']
+        set_context(chat,previous)
+        if wait.visible:return show_post(chat,pending['post'])
+        return
+    if pending.get('mode')=='schedule' and not text.startswith('/'):
+        import scheduling
+        due=scheduling.schedule(chat,pending['post'],pending['rev'],text)
+        set_context(chat,{})
+        return say(chat,'Публикация запланирована: '+due.strftime('%d.%m.%Y %H:%M')+' (Уфа, UTC+5).',inline=[[btn('К посту',f'view:{pending["post"]}:{pending["rev"]}')]])
     if pending.get('mode') == 'company_site' and not text.startswith('/'):
         site = company_knowledge.extract_url(text)
         if not site:
@@ -781,6 +899,8 @@ def message(chat, text):
         pending = context(chat)
         set_context(chat, pending['previous'])
         return message(chat, text)
+    if context(chat).get('mode') == 'content_plan_input':
+        return bot_features.generate_plan(chat, text)
     if state['editing']:
         if not 1 <= len(text) <= 4000:
             raise ValueError('Пришлите правку от 1 до 4000 символов.')
@@ -816,6 +936,7 @@ def message(chat, text):
             con.execute('DELETE FROM bot_confirmations WHERE post=?', (post_id,))
             remember_version(con, post_id, post['rev'] + 1, body, text, 'replace' if pending.get('mode') == 'replace' else 'rewrite')
             con.execute('INSERT OR REPLACE INTO bot_post_review(post,warnings,brand_name_mode,publication_date,fact_blocks) VALUES(?,?,?,?,?)', (post_id, json.dumps(notes, ensure_ascii=False), edited.get('brand_name_mode', review['brand_name_mode']), edited.get('publication_date', review['publication_date']), json.dumps(edited.get('fact_blocks', []), ensure_ascii=False)))
+        __import__('post_images').refresh_cover(chat,post_id)
         state['editing'] = post_id
         save(state)
         set_context(chat, {'mode': 'edit', 'rev': post['rev'] + 1, 'awaiting': False, 'memory': updated_memory})
@@ -844,6 +965,8 @@ def message(chat, text):
         if post:
             callback(chat, f'edit:{post["id"]}:{post["rev"]}')
             return message(chat, text)
+    if bot_features.preferences(chat)['fast']:
+        return create_posts(chat, text)
     return plan_event(chat, text)
 
 
@@ -866,6 +989,9 @@ def voice_message(chat, voice):
     previous = context(chat)
     if previous.get('mode') == 'voice':
         previous = previous['previous']
+    if bot_features.preferences(chat)['auto_voice']:
+        set_context(chat, previous)
+        return message(chat, text)
     nonce = secrets.token_hex(4)
     pending = {'mode': 'voice', 'text': text, 'previous': previous, 'nonce': nonce}
     set_context(chat, pending)
@@ -893,7 +1019,7 @@ def show_transcript(chat, pending):
 
 
 def read_navigation(data):
-    return data in ('home', 'posts', 'profile', 'help', 'settings', 'tg_app', 'plan_resume') or data.startswith(('view:', 'history:', 'notes:', 'page:'))
+    return data in ('home', 'posts', 'profile', 'help', 'settings', 'tg_app', 'plan_resume') or data.startswith(('view:', 'history:', 'notes:', 'page:', 'posts_page:'))
 
 
 def fast_navigation(chat, data):
@@ -946,6 +1072,17 @@ def dispatch_authorized(update):
 
 
 def handle(update):
+    import model_selection
+    query=update.get('callback_query')
+    msg=query.get('message',{}) if query else update.get('message',{})
+    sender=query.get('from',{}) if query else msg.get('from',{})
+    chat=msg.get('chat',{})
+    if chat.get('type')=='private' and str(sender.get('id')) in allowed_user_ids():
+        with model_selection.for_chat(chat['id']):return _handle(update)
+    return _handle(update)
+
+
+def _handle(update):
     query = update.get('callback_query')
     msg = query.get('message', {}) if query else update.get('message', {})
     sender = query.get('from', {}) if query else msg.get('from', {})
@@ -958,7 +1095,10 @@ def handle(update):
         return
     processed = False
     try:
-        if query:
+        import premium_emoji
+        if not query and premium_emoji.receive(chat['id'],msg):
+            pass
+        elif query:
             if not update.get('_callback_answered'):
                 try:
                     tg('answerCallbackQuery', {'callback_query_id': query['id']})
@@ -972,6 +1112,8 @@ def handle(update):
             message(chat['id'], msg['text'].strip())
         elif msg.get('voice'):
             voice_message(chat['id'], msg['voice'])
+        elif msg.get('photo'):
+            bot_features.receive_photo(chat['id'], msg['photo'])
         else:
             say(chat['id'], 'Пока принимаю текстовые ответы. Документы и изображения добавим следующим этапом.')
         processed = True
@@ -980,6 +1122,10 @@ def handle(update):
         buttons = [[btn('↻ Повторить', 'retry'), btn('✕ Отменить задачу', 'task_cancel')]] if pending.get('mode') in ('task', 'planning', 'plan_retry') else None
         if pending.get('retry_instruction'):
             buttons = [[btn('↻ Повторить правку', 'retry'), btn('← К посту', 'stop_edit')]]
+        if pending.get('mode') == 'content_plan_input' and pending.get('request'):
+            buttons = [[btn('↻ Повторить', 'feat_plan_retry'), btn('← Меню', 'home')]]
+        if pending.get('mode')=='emoji_palette':buttons=[[btn('К настройкам','feat_emoji_close')]]
+        if pending.get('mode')=='image_edit':buttons=[[btn('К посту','feat_art_cancel')]]
         say(chat['id'], str(error), inline=buttons)
         processed = True
     except Exception:
@@ -1038,16 +1184,42 @@ def worker(chat, stop):
             stop.wait(1)
 
 
+def configure_miniapp():
+    url = os.environ.get('MINI_APP_URL', '').strip()
+    parts = urlparse(url)
+    if parts.scheme != 'https' or not parts.hostname or parts.username or parts.password:
+        return False
+    tg('setChatMenuButton', {'menu_button': {'type': 'web_app', 'text': 'Открыть', 'web_app': {'url': url}}})
+    for owner in allowed_user_ids():
+        try:
+            tg('setChatMenuButton', {'chat_id': int(owner), 'menu_button': {'type': 'web_app', 'text': 'Открыть', 'web_app': {'url': url}}})
+        except TelegramAPIError as error:
+            if error.reason!='chat_not_found':raise
+            # New allowed users may not have pressed /start yet; default menu
+            # is already configured and becomes available when they do.
+    return True
+
+
+def connect_telegram():
+    delay=5
+    while True:
+        try:
+            return tg('getMe',{}),tg('getWebhookInfo',{})
+        except TelegramConnectionError:
+            print(f'Telegram временно недоступен. Повторное подключение через {delay} сек. Окно можно оставить открытым.',flush=True)
+            time.sleep(delay)
+            delay=min(delay*2,30)
+
+
 def main():
     if not os.environ.get('TELEGRAM_BOT_TOKEN'):
         print('Заполните TELEGRAM_BOT_TOKEN в .env. Инструкция: TELEGRAM.md')
         return
     init_db()
-    print('MarketPilot Telegram bot started. Keep this window open. Ctrl+C to stop.')
+    print('Подключаюсь к Telegram… Ctrl+C для остановки.',flush=True)
     # Do not delete an existing webhook silently: a token must belong to this deployment.
     try:
-        identity = tg('getMe', {})
-        webhook = tg('getWebhookInfo', {})
+        identity,webhook = connect_telegram()
     except ValueError as error:
         print(error)
         return
@@ -1055,11 +1227,18 @@ def main():
         print('У бота настроен webhook. Используйте отдельного тестового бота без webhook.')
         return
     activate_bot(identity['id'])
+    print('Бот подключён и работает. Оставьте это окно открытым.',flush=True)
+    try:
+        configure_miniapp()
+    except ValueError:
+        print('Mini App menu unavailable; bot continues working.')
     with app.db() as con:
         row = con.execute('SELECT value FROM bot_meta WHERE key="offset"').fetchone()
     offset = row['value'] if row else 0
     stop = threading.Event()
     workers = {}
+    import scheduling
+    scheduling.start(stop)
 
     def ensure_worker(chat):
         if chat not in workers or not workers[chat].is_alive():
@@ -1101,4 +1280,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    from runtime_lock import single_instance
+    try:
+        with single_instance(app.ROOT/'data'/'telegram_bot.lock'):
+            main()
+    except BlockingIOError:
+        print('Бот уже работает. Второй запуск не нужен. Это окно можно закрыть.')
+    except KeyboardInterrupt:
+        print('Бот остановлен.')

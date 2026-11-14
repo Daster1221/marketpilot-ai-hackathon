@@ -11,6 +11,16 @@ import telegram_screen
 
 
 class StageTests(unittest.TestCase):
+    def test_decorative_banner_does_not_split_complete_draft_into_captions(self):
+        text='Связный текст публикации. '*45
+        with patch.object(bot,'tg',self.api):
+            bot.say(42,text,stage='draft')
+        state=telegram_screen.get(42)
+        import json
+        self.assertEqual(len(json.loads(state['pages'])),1)
+        self.assertFalse(state['media'])
+        self.assertNotIn('sendPhoto',[c.args[0] for c in self.api.call_args_list])
+
     def test_loading_hides_banner_and_never_sends_new_photo(self):
         with patch.object(bot, 'tg', self.api):
             bot.say(42, 'Пост', stage='draft')
@@ -20,7 +30,7 @@ class StageTests(unittest.TestCase):
             with wait:
                 wait.tick()
         methods = [call.args[0] for call in self.api.call_args_list]
-        self.assertIn('deleteMessage', methods)
+        self.assertIn('sendMessage', methods)
         self.assertNotIn('sendPhoto', methods)
         self.assertNotIn('editMessageMedia', methods)
         with app.db() as con:
@@ -78,7 +88,7 @@ class StageTests(unittest.TestCase):
         with patch.object(app.urllib.request, 'urlopen', return_value=response) as opening:
             app.remote_photo('https://example.test/upload', {'chat_id': 42, 'media': {'type': 'photo', 'media': 'attach://photo'}}, path)
         request = opening.call_args.args[0]
-        self.assertIn(b'name="photo"; filename="stage.png"', request.data)
+        self.assertIn(b'name="photo"; filename="facts.png"', request.data)
         self.assertIn(b'example-png', request.data)
         self.assertIn(b'"media": "attach://photo"', request.data)
         self.assertIn('multipart/form-data', request.get_header('Content-type'))

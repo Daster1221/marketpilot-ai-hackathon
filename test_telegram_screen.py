@@ -138,7 +138,7 @@ class ScreenTests(unittest.TestCase):
         with patch.object(bot, 'tg', self.api), patch.object(app, 'prepare_posts', side_effect=generate):
             bot.create_posts(42, 'Один пост')
         state = screen.get(42)
-        self.assertIn('Салаватстекло Бот', json.loads(state['pages'])[0])
+        self.assertIn('Ваш AI-редактор', json.loads(state['pages'])[0])
         with app.db() as con:
             self.assertEqual(con.execute('SELECT body FROM bot_posts').fetchone()[0], 'Готовый текст')
 

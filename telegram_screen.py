@@ -3,6 +3,8 @@ import json
 import secrets
 import threading
 import time
+import os
+from pathlib import Path
 
 import app
 import post_format
@@ -18,6 +20,8 @@ def chat_lock(chat):
 
 def init_db(con):
     con.execute('CREATE TABLE IF NOT EXISTS bot_screens (chat INTEGER PRIMARY KEY, message_id INTEGER, pages TEXT, buttons TEXT, page INTEGER, formatted INTEGER, nonce TEXT, last_payload TEXT)')
+    if 'media' not in {r['name'] for r in con.execute('PRAGMA table_info(bot_screens)')}:
+        con.execute("ALTER TABLE bot_screens ADD COLUMN media TEXT NOT NULL DEFAULT ''")
 
 
 def get(chat):
@@ -28,7 +32,7 @@ def get(chat):
 
 def save(state):
     with app.db() as con:
-        con.execute('INSERT OR REPLACE INTO bot_screens VALUES(?,?,?,?,?,?,?,?)', tuple(state[k] for k in ('chat', 'message_id', 'pages', 'buttons', 'page', 'formatted', 'nonce', 'last_payload')))
+        con.execute('INSERT OR REPLACE INTO bot_screens(chat,message_id,pages,buttons,page,formatted,nonce,last_payload,media) VALUES(?,?,?,?,?,?,?,?,?)', tuple(state.get(k, '') for k in ('chat', 'message_id', 'pages', 'buttons', 'page', 'formatted', 'nonce', 'last_payload', 'media')))
 
 
 def delete(chat, message_id, api):
@@ -69,14 +73,32 @@ def payload_for(state):
 
 def update(state, api):
     payload = payload_for(state)
-    signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    signature = json.dumps([payload, state.get('media', '')], ensure_ascii=False, sort_keys=True)
     if state['last_payload'] == signature:
         save(state)
         return {'message_id': state['message_id']}
     old_id = state['message_id']
-    if old_id:
+    previous = get(state['chat'])
+    media = state.get('media', '')
+    same_kind = bool(media) == bool(previous and previous.get('media'))
+    if old_id and same_kind:
         try:
-            result = api('editMessageText', {**payload, 'message_id': old_id})
+            if media:
+                values = {'chat_id': state['chat'], 'message_id': old_id, 'reply_markup': payload['reply_markup']}
+                if media == previous.get('media'):
+                    values.update(caption=payload['text'])
+                    if state['formatted']:
+                        values['parse_mode'] = 'HTML'
+                    result = api('editMessageCaption', values)
+                else:
+                    values['media'] = {'type': 'photo', 'media': 'attach://photo' if media.endswith(('.png','.jpg','.webp')) else media, 'caption': payload['text']}
+                    if state['formatted']:
+                        values['media']['parse_mode'] = 'HTML'
+                    if media.endswith(('.png','.jpg','.webp')):
+                        values['_photo_path'] = media
+                    result = api('editMessageMedia', values)
+            else:
+                result = api('editMessageText', {**payload, 'message_id': old_id})
         except ValueError as error:
             if getattr(error, 'reason', None) == 'not_modified':
                 result = {'message_id': old_id}
@@ -85,6 +107,7 @@ def update(state, api):
             else:
                 raise
         else:
+            remember_media(media, result)
             state['last_payload'] = signature
             save(state)
             return result
@@ -99,8 +122,16 @@ def update(state, api):
         removed = api('sendMessage', {'chat_id': state['chat'], 'text': 'Открываю рабочий экран…',
                                      'disable_notification': True, 'reply_markup': {'remove_keyboard': True}})
         cleanup_id = removed['message_id']
-    sent = api('sendMessage', payload)
+    if media:
+        values = {'chat_id': state['chat'], 'caption': payload['text'], 'reply_markup': payload['reply_markup']}
+        values.update({'_photo_path': media} if media.endswith(('.png','.jpg','.webp')) else {'photo': media})
+        if state['formatted']:
+            values['parse_mode'] = 'HTML'
+        sent = api('sendPhoto', values)
+    else:
+        sent = api('sendMessage', payload)
     state['message_id'] = sent['message_id']
+    remember_media(media, sent)
     state['last_payload'] = signature
     save(state)
     if cleanup_id:
@@ -110,18 +141,30 @@ def update(state, api):
     return sent
 
 
-def show(chat, text, buttons, formatted, api):
+def remember_media(media, result):
+    photos = result.get('photo', [])
+    if media.endswith(('.png','.jpg','.webp')) and photos:
+        with app.db() as con:
+            con.execute('INSERT OR REPLACE INTO bot_stage_files VALUES(?,?,?)', (os.environ.get('TELEGRAM_BOT_TOKEN', '').split(':')[0], Path(media).stem, photos[-1]['file_id']))
+
+
+def show(chat, text, buttons, formatted, api, media=''):
     with chat_lock(chat):
-        return _show(chat, text, buttons, formatted, api)
+        return _show(chat, text, buttons, formatted, api, media)
 
 
-def _show(chat, text, buttons, formatted, api):
+def _show(chat, text, buttons, formatted, api, media=''):
+    if media.endswith(('.png','.jpg','.webp')):
+        with app.db() as con:
+            cached = con.execute('SELECT file_id FROM bot_stage_files WHERE bot=? AND stage=?', (os.environ.get('TELEGRAM_BOT_TOKEN', '').split(':')[0], Path(media).stem)).fetchone()
+        if cached:
+            media = cached['file_id']
     old = get(chat)
     state = {'chat': chat, 'message_id': old['message_id'] if old else None,
-             'pages': json.dumps(post_format.split_pages(text, formatted=formatted), ensure_ascii=False),
+             'pages': json.dumps(post_format.split_pages(text, limit=950 if media else 3600, formatted=formatted), ensure_ascii=False),
              'buttons': json.dumps(buttons, ensure_ascii=False), 'page': 0,
              'formatted': int(formatted), 'nonce': secrets.token_hex(5),
-             'last_payload': old['last_payload'] if old else ''}
+             'last_payload': old['last_payload'] if old else '', 'media': media}
     return update(state, api)
 
 
@@ -157,7 +200,7 @@ class Loading:
     def __enter__(self):
         self.action_at = 0
         self.typing()
-        show(self.chat, f'{self.label}\n\n{self.frames[0]}', [[{'text': '⌂ Меню', 'callback_data': 'home'}]], False, self.api)
+        show(self.chat, f'{self.label}\n\n{self.frames[0]}', [[{'text': 'В меню', 'callback_data': 'home'}]], False, self.api)
         self.nonce = get(self.chat)['nonce']
         if self.threaded:
             self.thread = threading.Thread(target=self.run, daemon=True)

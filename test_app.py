@@ -12,6 +12,22 @@ import app
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_planning_repairs_invalid_schema_using_original_clarification(self):
+        valid={'facts':[{'label':'Период','value':'Месяц'}],'question':'','ideas':[{'title':str(i),'angle':'Акцент'} for i in range(3)]}
+        with patch.object(app,'ai_json',side_effect=[{'facts':[]},valid]) as ai:
+            result=app.plan_publication('Компания','Рост продаж на 20%','За месяц')
+        self.assertEqual(result['facts'],valid['facts'])
+        self.assertEqual(ai.call_count,2)
+        self.assertEqual(ai.call_args_list[0].args[1]['clarification'],ai.call_args_list[1].args[1]['clarification'])
+        self.assertIn('response_format_reminder',ai.call_args.args[1])
+
+    def test_planning_keeps_extra_valid_facts_without_retry(self):
+        facts=[{'label':str(i),'value':'Подтверждённый факт'} for i in range(9)]
+        with patch.object(app,'ai_json',return_value={'facts':facts,'question':'Уточните период','ideas':[]}) as ai:
+            result=app.plan_publication('Компания','Новость')
+        self.assertEqual(len(result['facts']),9)
+        ai.assert_called_once()
+
     def test_planning_validates_ideas_and_keeps_editorial_direction_separate(self):
         with patch.object(app, 'ai_json', return_value={'facts': [{'label': 'Событие', 'value': 'Экскурсия'}], 'question': '', 'ideas': []}):
             with self.assertRaises(ValueError):

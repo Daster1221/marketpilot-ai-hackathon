@@ -4,8 +4,17 @@ from html.parser import HTMLParser
 import re
 
 
+def opening_tag(tag,attrs=()):
+    values=dict(attrs)
+    if tag=='tg-emoji':
+        identifier=values.get('emoji-id','') or ''
+        return '<tg-emoji emoji-id="'+identifier+'">' if re.fullmatch(r'[0-9]{1,25}',identifier) else ''
+    if tag=='blockquote' and 'expandable' in values:return '<blockquote expandable>'
+    return '<'+tag+'>'
+
+
 class PostParser(HTMLParser):
-    allowed = {'b', 'i', 'u', 's', 'blockquote', 'tg-spoiler'}
+    allowed = {'b', 'i', 'u', 's', 'blockquote', 'tg-spoiler','tg-emoji'}
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -22,12 +31,14 @@ class PostParser(HTMLParser):
                 return
             tag = 'tg-spoiler'
         if tag in self.allowed:
+            opening=opening_tag(tag,attrs)
+            if not opening:return
             if tag == 'blockquote' and tag in self.stack:
                 return
             # Telegram does not allow a blockquote inside inline formatting.
             if tag == 'blockquote':
                 self.close_all()
-            self.parts.append('<' + tag + '>')
+            self.parts.append(opening)
             self.stack.append(tag)
         elif tag == 'br':
             self.handle_data('\n')
@@ -83,7 +94,7 @@ def layout(value):
     value = normalize(value)
     value = re.sub(r'(?m)^((?:Дата|Время|Место|Начало|Регистрация|Участники|Результат|Срок)\s*:)', r'<b>\1</b>', value)
     head, sep, rest = value.partition('\n')
-    if sep and plain(head) and length(head) <= 160 and not head.lstrip().startswith(('-', '○', '<blockquote>')):
+    if sep and plain(head) and length(head) <= 160 and not head.lstrip().startswith(('-', '○', '<blockquote')):
         if not head.startswith('<b>'):
             head = '<b>' + head + '</b>'
         value = head + '\n\n' + rest.lstrip('\n')
@@ -95,37 +106,60 @@ def split_pages(value, limit=3600, formatted=False):
     if limit < 2:
         raise ValueError('Page limit must be at least two UTF-16 units')
     source = normalize(value) if formatted else value
-    pages, parts, stack = [], [], []
+    pages, parts, stack,openings = [], [], [],[]
     units = 0
 
     def flush():
         nonlocal parts, units
         if units:
             pages.append(''.join(parts) + ''.join('</' + tag + '>' for tag in reversed(stack)))
-        parts = ['<' + tag + '>' for tag in stack]
+        parts = list(openings)
         units = 0
 
     def add_text(text):
         nonlocal units
-        for char in text:
-            size = len(char.encode('utf-16-le')) // 2
-            if units + size > limit:
+        for token in re.findall(r'\s+|\S+',text):
+            token_size=len(token.encode('utf-16-le'))//2
+            if token_size<=limit and units+token_size>limit:
                 flush()
-            parts.append(escape(char, quote=False) if formatted else char)
-            units += size
+            for char in token:
+                size = len(char.encode('utf-16-le')) // 2
+                if units + size > limit:
+                    flush()
+                parts.append(escape(char, quote=False) if formatted else char)
+                units += size
 
     if formatted:
         class Pager(HTMLParser):
+            emoji_parts=None
             def handle_starttag(self, tag, attrs):
-                parts.append('<' + tag + '>')
+                opening=opening_tag(tag,attrs)
+                if self.emoji_parts is not None:
+                    self.emoji_parts.append(opening);return
+                if tag=='tg-emoji':
+                    self.emoji_parts=[opening];return
+                parts.append(opening);openings.append(opening)
                 stack.append(tag)
 
             def handle_endtag(self, tag):
+                nonlocal units
+                if self.emoji_parts is not None:
+                    self.emoji_parts.append('</'+tag+'>')
+                    if tag=='tg-emoji':
+                        atom=''.join(self.emoji_parts);self.emoji_parts=None
+                        count=length(atom)
+                        if count>limit:add_text(plain(atom))
+                        else:
+                            if units+count>limit:flush()
+                            parts.append(atom);units+=count
+                    return
                 parts.append('</' + tag + '>')
                 stack.pop()
+                openings.pop()
 
             def handle_data(self, text):
-                add_text(text)
+                if self.emoji_parts is not None:self.emoji_parts.append(escape(text,quote=False))
+                else:add_text(text)
         parser = Pager(convert_charrefs=True)
         parser.feed(source)
         parser.close()
@@ -136,17 +170,11 @@ def split_pages(value, limit=3600, formatted=False):
 
 
 AI_FORMAT_RULES = (
-    ' Оформляй body как готовый Telegram-пост в HTML. Первая строка — короткий заголовок с главным фактом целиком в <b>. '
-    'После заголовка — пустая строка и ясный лид. Отделяй смысловые абзацы пустой строкой; избегай стены текста. '
-    'Выделяй <b>ключевые даты, место, результат или нужное действие</b>, когда они есть в исходных данных. '
-    'Для короткой второстепенной ремарки уместен <i>курсив</i>. Не выделяй целые абзацы и не создавай акценты ради акцентов. '
-    'Спойлер оформляй как <tg-spoiler>скрытый текст</tg-spoiler>. Используй по просьбе пользователя или для уместного сюрприза, не скрывай дату, адрес и обязательные условия. '
-    'Однородные факты, расписание и инструкции оформляй списком с дефисами или номерами. Не делай список для обычного рассказа. '
-    'Для отдельной плашки подтверждённых цифр или важных фактов используй внутренний тег <aside>...</aside>; '
-    'бот отобразит его как Telegram-блок. Это авторское изложение фактов, а не прямая речь. Не повторяй соседний абзац. '
-    '<blockquote> используй только для реальной дословной цитаты из входа. Не выдумывай цитаты и говорящих. '
-    'В развёрнутом анонсе с программой или несколькими фактами обязательно сделай одну компактную плашку aside. В коротком служебном уведомлении она необязательна. '
-    'Разрешены теги b, i, u, s, tg-spoiler, blockquote и внутренний aside без атрибутов. Не вкладывай блоки друг в друга. '
-    'Не используй Markdown, HTML-обёртки, теги ссылок или блоки кода. Подтверждённые URL пиши обычным текстом. '
-    'Переносы строк — обычные символы новой строки.'
+    ' Оформи готовый пост в Telegram HTML: короткий заголовок в <b>, удобные абзацы, смысловые выделения там, где они помогают чтению. '
+    'Структуру определяет развитие мысли, а не обязательный набор лида, списка и плашки. '
+    'Выделяй главную мысль и важные числа жирным, короткую ремарку курсивом; не раскрашивай каждый абзац. Для смысловой плашки доступен <aside>, а для длинного раскрываемого блока <aside expandable>. Используй по делу, не разрывая рассказ. '
+    '<blockquote> только для действительно приведённых слов человека. '
+    'Используй возможности оформления заметно и по смыслу: расписание, адрес или ключевую авторскую мысль можно вынести в <aside> — бот покажет цитатную плашку, это не прямая речь. Короткий авторский акцент можно оформить <i>. Необязательную интригу или дополнительную деталь можно оформить <tg-spoiler>; не скрывай адрес, дату, условия и главное действие. Если пользователь попросил цитатное оформление, а слов человека нет, используй авторскую плашку <aside>, не выдумывай говорящего. '
+    'Разрешены b, i, u, s, tg-spoiler, blockquote и внутренний aside; для aside и blockquote допустим только атрибут expandable. В спойлер не прячь условия участия. '
+    'Используй обычные переносы строк, без Markdown, HTML-обёрток и блоков кода. Ссылки пиши обычным текстом, если они даны в материалах.'
 )

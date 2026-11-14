@@ -3,10 +3,16 @@ import ipaddress
 import json
 import re
 import socket
+import codecs
+import time
+import zlib
 import urllib.request
 from html.parser import HTMLParser
 from urllib.parse import urlsplit, urljoin, urlunsplit
 import app
+
+MAX_PAGE_BYTES = 8_000_000
+MAX_TEXT = 14_000
 
 
 def init_db(con):
@@ -51,43 +57,61 @@ class Page(HTMLParser):
         self.hidden = 0
         self.text = []
         self.links = []
+        self.text_size = 0
 
     def handle_starttag(self, tag, attrs):
         if tag in ('script', 'style', 'noscript', 'svg', 'template'):
             self.hidden += 1
         if tag == 'a' and not self.hidden:
-            self.links.append(dict(attrs).get('href', ''))
+            if len(self.links) < 300:
+                self.links.append(dict(attrs).get('href', ''))
 
     def handle_endtag(self, tag):
         if tag in ('script', 'style', 'noscript', 'svg', 'template'):
             self.hidden = max(0, self.hidden - 1)
 
     def handle_data(self, value):
-        if not self.hidden and value.strip():
-            self.text.append(value.strip())
+        if not self.hidden and value.strip() and self.text_size < MAX_TEXT:
+            text = value.strip()[:MAX_TEXT - self.text_size]
+            self.text.append(text)
+            self.text_size += len(text)
 
 
 def fetch(url):
     url = public_url(url)
     opener = urllib.request.build_opener(Redirect())
-    req = urllib.request.Request(url, headers={'User-Agent': 'MarketPilot-CompanyReader/1.0'})
+    req = urllib.request.Request(url, headers={'User-Agent': 'MarketPilot-CompanyReader/1.0', 'Accept-Encoding': 'identity'})
+    page = Page()
     try:
         with opener.open(req, timeout=12) as response:
             if response.headers.get_content_type() not in ('text/html', 'text/plain'):
                 raise ValueError('По ссылке нет текстовой страницы компании.')
-            raw = response.read(1_000_001)
-            if len(raw) > 1_000_000:
-                raise ValueError('Страница слишком большая. Укажите страницу «О компании».')
             charset = response.headers.get_content_charset() or 'utf-8'
-            html = raw.decode(charset, errors='replace')
+            try:
+                decoder = codecs.getincrementaldecoder(charset)(errors='replace')
+            except LookupError:
+                decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+            compressed = response.headers.get('Content-Encoding', '').lower() == 'gzip'
+            unpack = zlib.decompressobj(16 + zlib.MAX_WBITS) if compressed else None
+            received = expanded = 0
+            deadline = time.monotonic() + 20
+            while received < MAX_PAGE_BYTES and expanded < MAX_PAGE_BYTES and time.monotonic() < deadline:
+                chunk = response.read(min(65536, MAX_PAGE_BYTES - received))
+                if not chunk:
+                    break
+                received += len(chunk)
+                content = unpack.decompress(chunk, MAX_PAGE_BYTES - expanded) if unpack else chunk
+                expanded += len(content)
+                page.feed(decoder.decode(content))
+                if page.text_size >= MAX_TEXT:
+                    break
+            page.feed(decoder.decode(b'', final=True))
             final_url = response.geturl()
     except ValueError:
         raise
     except Exception:
         raise ValueError('Не удалось прочитать сайт. Попробуйте страницу «О компании» или повторите позже.') from None
-    page = Page()
-    page.feed(html)
-    text = '\n'.join(page.text)[:14000]
+    text = '\n'.join(page.text)[:MAX_TEXT]
     if len(text) < 80:
         raise ValueError('На странице мало доступного текста. Пришлите ссылку на страницу «О компании».')
     return final_url, text, page.links
