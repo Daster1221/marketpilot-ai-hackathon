@@ -74,3 +74,16 @@ class MiniAppTests(unittest.TestCase):
             handler.do_GET()
             handler.send_response.assert_called_once_with(200)
             self.assertTrue(handler.wfile.getvalue())
+
+
+class DocumentUploadTests(unittest.TestCase):
+    def test_document_upload_is_signed_same_origin_bounded_and_queued(self):
+        import miniapp_api as api
+        handler=miniapp_server.Handler.__new__(miniapp_server.Handler)
+        handler.path='/documents';handler.rfile=io.BytesIO(b'facts')
+        handler.headers={'Host':'live.example','Origin':'https://live.example','Content-Type':'application/octet-stream','Content-Length':'5','X-Filename':'company.txt','X-Request-ID':'document-test'}
+        handler.api_response=Mock()
+        with patch.object(api,'authenticate',return_value=42),patch.object(api,'enqueue',return_value={'job_id':'123'}) as enqueue:
+            handler.do_POST();self.assertEqual(enqueue.call_args.args[1]['document'],b'facts')
+            handler.headers['Origin']='https://foreign.example';handler.do_POST()
+            self.assertEqual(handler.api_response.call_args.args[0],403);self.assertEqual(enqueue.call_count,1)

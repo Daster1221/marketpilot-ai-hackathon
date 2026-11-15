@@ -189,18 +189,22 @@ class Loading:
     """Animate only our own screen; never overwrite navigation or invent progress."""
     frames = ('● ○ ○', '○ ● ○', '○ ○ ●', '○ ● ○')
 
-    def __init__(self, chat, label, api, background_api=None, threaded=True):
+    def __init__(self, chat, label, api, background_api=None, threaded=True, renderer=None, interval=1, action='typing'):
         self.chat, self.label, self.api = chat, label, api
         self.background_api = background_api or api
         self.threaded = threaded
         self.stop_event = threading.Event()
         self.thread = None
         self.frame = 0
+        self.renderer,self.interval,self.action=renderer,interval,action
+
+    def text(self):
+        return self.renderer(self.frame) if self.renderer else f'{self.label}\n\n{self.frames[self.frame % len(self.frames)]}'
 
     def __enter__(self):
         self.action_at = 0
         self.typing()
-        show(self.chat, f'{self.label}\n\n{self.frames[0]}', [[{'text': 'В меню', 'callback_data': 'home'}]], False, self.api)
+        show(self.chat, self.text(), [[{'text': 'В меню', 'callback_data': 'home'}]], bool(self.renderer), self.api)
         self.nonce = get(self.chat)['nonce']
         if self.threaded:
             self.thread = threading.Thread(target=self.run, daemon=True)
@@ -216,10 +220,10 @@ class Loading:
         with chat_lock(self.chat):
             if self.stop_event.is_set() or not self.visible:
                 return False
-            self.frame = (self.frame + 1) % len(self.frames)
+            self.frame += 1
             state = get(self.chat)
             self.typing()
-            state['pages'] = json.dumps([f'{self.label}\n\n{self.frames[self.frame]}'], ensure_ascii=False)
+            state['pages'] = json.dumps([self.text()], ensure_ascii=False)
             update(state, self.background_api)
             return True
 
@@ -228,12 +232,12 @@ class Loading:
             return
         self.action_at = time.monotonic()
         try:
-            self.background_api('sendChatAction', {'chat_id': self.chat, 'action': 'typing'})
+            self.background_api('sendChatAction', {'chat_id': self.chat, 'action': self.action})
         except Exception:
             pass
 
     def run(self):
-        while not self.stop_event.wait(1):
+        while not self.stop_event.wait(self.interval):
             try:
                 if not self.tick():
                     break

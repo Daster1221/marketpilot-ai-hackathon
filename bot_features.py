@@ -39,6 +39,7 @@ def settings(chat):
         [b.btn('Режим: ' + ('Быстрый' if p['fast'] else 'Подробный'), 'feat_toggle:fast')],
         [b.btn('Голос: ' + ('Принимать сразу' if p['auto_voice'] else 'Проверять текст'), 'feat_toggle:auto_voice')],
         [b.btn('Отправка: ' + ('С проверкой' if p['confirm_publish'] else 'Сразу'), 'feat_toggle:confirm_publish')],
+        [b.btn('Функционал для презентации', 'project_info')],
         [b.btn('Очистить отменённые посты', 'feat_cleanup')],
         [b.btn('Сбросить компанию', 'company_reset', style='danger'), b.btn('← Меню', 'home')]], formatted=True)
 
@@ -172,9 +173,9 @@ def callback(chat, data):
         items=json.loads(row['data']); i=int(parts[2])
         if not 0<=i<len(items):
             raise ValueError('Тема не найдена.')
-        task='Подготовь один пост. Идея из контент-плана, не подтверждённое событие: '+items[i]['topic']+'\n'+items[i]['angle']
+        selected=__import__('marketer').plan_topic(chat,row['nonce'],i)
         b.focus_post(chat)
-        return b.create_posts(chat,task) if preferences(chat)['fast'] else b.plan_event(chat,task)
+        return b.create_posts(chat,selected['task'],selected['clarification']) if preferences(chat)['fast'] else b.plan_event(chat,selected['task'],selected['clarification'])
     if action in ('feat_delete','feat_cleanup'):
         with app.db() as con:
             if action=='feat_cleanup':

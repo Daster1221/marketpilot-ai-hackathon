@@ -138,3 +138,14 @@ class WorkflowTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StructuredResponseTests(unittest.TestCase):
+    def test_claude_preface_and_fenced_json_need_no_paid_retry(self):
+        raw='Пояснение перед ответом.\n```json\n{"answer":"Готово","memory":"","plan":[]}\n```'
+        with patch.object(app,'deepseek_request',return_value={'choices':[{'finish_reason':'stop','message':{'content':raw}}]}) as request:
+            result=app.ai_json('Return JSON',{})
+        self.assertEqual(result['answer'],'Готово');request.assert_called_once()
+    def test_ambiguous_or_partial_objects_are_never_repaired(self):
+        for raw in ('```json\n{"a":1}\n```\n```json\n{"b":2}\n```','```json\n{"unfinished":\n```','[]'):
+            with self.assertRaises(ValueError):app.parse_ai_object(raw)

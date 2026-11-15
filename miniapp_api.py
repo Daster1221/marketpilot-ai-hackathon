@@ -46,6 +46,7 @@ def init_db():
         import bot_features, company_knowledge
         bot_features.init_db(con)
         company_knowledge.init_db(con)
+        __import__('marketer').init_db(con)
         con.execute('CREATE TABLE IF NOT EXISTS mini_workflows (id TEXT PRIMARY KEY,chat INTEGER,task TEXT,clarification TEXT,plan TEXT)')
         con.execute('CREATE TABLE IF NOT EXISTS mini_jobs (id TEXT PRIMARY KEY,chat INTEGER,request_key TEXT,status TEXT,result TEXT,created REAL,UNIQUE(chat,request_key))')
         con.execute('CREATE INDEX IF NOT EXISTS mini_jobs_chat_created ON mini_jobs(chat,created DESC)')
@@ -72,6 +73,7 @@ def authenticate(raw):
             raise ValueError()
     except (ValueError,KeyError,TypeError):
         raise PermissionError('Сессия истекла или нет доступа к этому боту.') from None
+    __import__('user_access').observe(user)
     return chat
 
 
@@ -132,7 +134,7 @@ def data(chat):
     knowledge=company_knowledge.get(chat)
     site=bot.company_site(state)
     rendered=[serialize(p,p,summary=True) for p in posts]
-    return {'posts':rendered, 'counts':{'created':len(posts),'published':sum(p['status']=='published' for p in posts),'scheduled':sum(p['status'] in ('SCHEDULED','QUEUED') for p in rendered),'failed':sum(p['status']=='delivery_unknown' for p in posts)},'profile':{'model':model_selection.model_for(chat),'model_options':list(model_selection.MODELS),'audience':answers.get('audience',''),'tone':answers.get('style',''),'goals':answers.get('objective',''),'company':answers.get('company',''),'site':site,'summary':knowledge['summary'] if knowledge and knowledge['url']==site else '', 'accounts':[],'notifications':True},'sources':[{'title':'Сайт компании','url':site}] if site else [],'timezone':'Asia/Yekaterinburg'}
+    return {'posts':rendered, 'counts':{'created':len(posts),'published':sum(p['status']=='published' for p in posts),'scheduled':sum(p['status'] in ('SCHEDULED','QUEUED') for p in rendered),'failed':sum(p['status']=='delivery_unknown' for p in posts)},'profile':{'can_manage_users':chat in __import__('user_access').admin_ids(),'model':model_selection.model_for(chat),'model_options':list(model_selection.MODELS),'audience':answers.get('audience',''),'tone':answers.get('style',''),'goals':answers.get('objective',''),'company':answers.get('company',''),'site':site,'summary':knowledge['summary'] if knowledge and knowledge['url']==site else '', 'accounts':[],'notifications':True},'sources':[{'title':'Сайт компании','url':site}] if site else [],'timezone':'Asia/Yekaterinburg'}
 
 
 def save_generated(chat,wf,result):
@@ -158,6 +160,18 @@ def workflow(chat,request):
 
 def _workflow(chat,request):
     operation=request.get('operation')
+    if operation=='marketer':return __import__('marketer').ask(chat,request.get('text',''))
+    if operation=='document':return __import__('company_documents').ingest(chat,request.get('filename',''),request.get('document',b''))
+    if operation=='document_delete':
+        __import__('company_documents').delete(chat,int(request.get('document_id',0)))
+        return {'documents':__import__('company_documents').listing(chat)}
+    if operation=='plan_topic':
+        selected=__import__('marketer').plan_topic(chat,request.get('plan_nonce',''),request.get('topic_index'))
+        wf={'id':secrets.token_hex(16),'chat':chat,**selected,'plan':'{}'}
+        result=app.plan_publication(bot.brief(bot.session(chat)),wf['task'],wf['clarification'])
+        wf['plan']=json.dumps(result,ensure_ascii=False)
+        with app.db() as con:con.execute('INSERT INTO mini_workflows VALUES(?,?,?,?,?)',(wf['id'],chat,wf['task'],wf['clarification'],wf['plan']))
+        return {'workflow_id':wf['id'],'task':wf['task'],**result}
     if operation=='image':
         import post_images
         p=post(chat,int(request.get('post_id',0)))

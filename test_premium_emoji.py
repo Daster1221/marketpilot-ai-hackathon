@@ -16,6 +16,18 @@ class PremiumEmojiTests(unittest.TestCase):
         self.assertIn('<tg-emoji emoji-id="5456202474312462007">👍</tg-emoji>',rendered)
         self.assertEqual(rendered,premium.render_private(body,99))
         self.assertEqual(premium.plain_emoji(rendered),body)
+    def test_saved_square_lists_render_cleanly_with_real_premium_entities(self):
+        body='<b>👍 Приложение</b>\n◾️ График\n◾️ Выплаты'
+        result=premium.render_private(body,42)
+        self.assertIn('• График\n• Выплаты',result)
+        self.assertNotIn('◾',result)
+        self.assertIn('<tg-emoji emoji-id=',result)
+
+    def test_publication_uses_premium_only_for_verified_group(self):
+        with patch.dict(app.os.environ,{'TELEGRAM_PREMIUM_GROUP_ID':'-1004360012354'}):
+            self.assertIn('<tg-emoji ',premium.render_publication('<b>👍 Новость</b>',42,'-1004360012354'))
+            self.assertNotIn('<tg-emoji ',premium.render_publication('<b>👍 Новость</b>',42,'-100other'))
+
     def test_formatting_keeps_only_supported_attributes(self):
         text=post_format.normalize('<blockquote expandable onclick="bad()">Факт</blockquote><tg-emoji emoji-id="5368324170671202286" onerror="bad()">👍</tg-emoji>')
         self.assertIn('<blockquote expandable>',text);self.assertIn('emoji-id="5368324170671202286"',text);self.assertNotIn('bad',text)

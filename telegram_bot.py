@@ -36,7 +36,15 @@ _BUSY_LOCK = threading.Lock()
 def loading(chat, label):
     with telegram_screen.chat_lock(chat):
         stage_header(chat, None)
-    return telegram_screen.Loading(chat, label, tg, background_api=lambda method, payload: tg(method, payload, timeout=3))
+    options={}
+    if any(word in label.lower() for word in ('изображ','облож','макет')):
+        import random,premium_emoji
+        phases=['Собираю визуальную композицию','Работаю над оформлением','Создаю изображение по теме поста','Готовлю визуал для публикации','Продолжаю работу над макетом']
+        random.shuffle(phases)
+        # Verified animated corporate emoji, not a static refresh glyph.
+        glyph=premium_emoji.render_private('💎',chat)
+        options={'renderer':lambda frame: '<b>'+escape(label)+'</b>\n\n'+glyph+' '+phases[frame%len(phases)]+'…', 'interval':3,'action':'upload_photo'}
+    return telegram_screen.Loading(chat, label, tg, background_api=lambda method, payload: tg(method, payload, timeout=3),**options)
 
 
 def is_busy(chat):
@@ -56,6 +64,12 @@ def btn(text, data, style=None):
         text = 'В меню'
     if data == 'new' or data.startswith('plan_draft:'):
         text, style = 'Создать пост', 'success'
+    if data=='tg_app':
+        from urllib.parse import urlsplit
+        url=os.environ.get('MINI_APP_URL','').strip()
+        parsed=urlsplit(url)
+        if parsed.scheme=='https' and parsed.hostname and not parsed.username and not parsed.password:
+            return {'text':text,'web_app':{'url':url},'style':'primary'}
     value = {'text': text, 'callback_data': data}
     if style:
         value['style'] = style
@@ -86,8 +100,7 @@ def focused_post(chat):
 
 
 def allowed_user_ids():
-    # Private bot: an empty list denies access to everyone.
-    return {value for value in re.split(r'[,;\s]+', os.environ.get('TELEGRAM_OWNER_ID', '').strip()) if value.isdecimal()}
+    return __import__('user_access').allowed_ids()
 
 
 def publication_channel(chat):
@@ -112,8 +125,10 @@ def activate_bot(bot_id):
 def init_db():
     with app.db() as con:
         telegram_screen.init_db(con)
+        __import__('user_access').init_db(con)
         bot_stages.init_db(con)
         company_knowledge.init_db(con)
+        __import__('marketer').init_db(con)
         bot_features.init_db(con)
         con.execute('CREATE TABLE IF NOT EXISTS bot_list_positions (chat INTEGER PRIMARY KEY, page INTEGER)')
         con.execute('CREATE TABLE IF NOT EXISTS bot_post_focus (chat INTEGER PRIMARY KEY, post INTEGER, rev INTEGER)')
@@ -157,7 +172,10 @@ def tg(method, payload, timeout=None):
     token = os.environ['TELEGRAM_BOT_TOKEN']
     try:
         url = f'https://api.telegram.org/bot{token}/{method}'
-        if '_photo_path' in payload:
+        if '_document_path' in payload:
+            values=dict(payload);path=values.pop('_document_path')
+            result=app.remote_photo(url,values,path,timeout=timeout or 20,field='document')
+        elif '_photo_path' in payload:
             values = dict(payload)
             path = values.pop('_photo_path')
             result = app.remote_photo(url, values, path, timeout=timeout or 20)
@@ -247,7 +265,7 @@ def save(state):
         con.execute('INSERT OR REPLACE INTO bot_sessions VALUES(?,?,?,?)', (state['chat'], state['step'], state['answers'], state['editing']))
 
 
-def brief(state):
+def brief(state, *, include_documents=True):
     answers = json.loads(state['answers'])
     text = '\n\n'.join(label + ': ' + answers.get(key, 'Не указано') for key, label, *_ in QUESTIONS)
     site = company_site(state)
@@ -256,6 +274,9 @@ def brief(state):
     knowledge = company_knowledge.get(state['chat'])
     if knowledge and knowledge['url'] == site and knowledge['summary']:
         text += '\n\nСправка по прочитанному сайту (фоновые сведения, не программа текущего события):\n' + knowledge['summary']
+    import company_documents
+    documents=company_documents.context(state['chat']) if include_documents else ''
+    if documents:text+='\n\nДокументы компании (фоновые сведения, не факты нового события):\n'+documents
     return text
 
 
@@ -398,6 +419,12 @@ def preview(chat, post):
 
 
 def callback(chat, data):
+    if data=='project_info':return project_handoff(chat)
+    if data=='marketer':return __import__('marketer').menu(chat)
+    if data=='knowledge':return __import__('marketer').documents_menu(chat)
+    if data.startswith('knowledge_delete:'):
+        __import__('company_documents').delete(chat,int(data.split(':')[1]))
+        return __import__('marketer').documents_menu(chat)
     if context(chat).get('mode')=='emoji_palette' and not data.startswith('feat_emoji'):
         set_context(chat,context(chat).get('previous',{}))
     if context(chat).get('mode')=='schedule' and (data.startswith('view:') or data=='home'):set_context(chat,{})
@@ -518,13 +545,13 @@ def callback(chat, data):
                 image = bot_features.image_for(post['id'])
                 if image:
                     import premium_emoji
-                    pages = post_format.split_pages(premium_emoji.remove_emoji(post['body']), limit=1000, formatted=True)
+                    pages = post_format.split_pages(premium_emoji.render_publication(post['body'],chat,channel), limit=1000, formatted=True)
                     result = tg('sendPhoto', {'chat_id': channel, **__import__('post_images').payload(image), 'caption': pages[0], 'parse_mode': 'HTML'})
                     for page in pages[1:]:
                         tg('sendMessage', {'chat_id': channel, 'text': page, 'parse_mode': 'HTML'})
                 else:
                     import premium_emoji
-                    result = tg('sendMessage', {'chat_id': channel, 'text': premium_emoji.remove_emoji(post_format.normalize(post['body'])), 'parse_mode': 'HTML'})
+                    result = tg('sendMessage', {'chat_id': channel, 'text': premium_emoji.render_publication(post['body'],chat,channel), 'parse_mode': 'HTML'})
             except Exception:
                 con.execute('UPDATE bot_posts SET status="delivery_unknown" WHERE id=?', (post['id'],))
                 con.commit()
@@ -536,11 +563,12 @@ def callback(chat, data):
 
 
 def home(chat):
+    if context(chat).get('mode')=='marketer':set_context(chat,{})
     focus_post(chat)
-    rows = [[btn('✨ Создать пост', 'new')],
-            [btn('🗂 Мои посты', 'posts'), btn('🏢 Компания', 'profile')],
-            [btn('⚙️ Настройки', 'settings'), btn('❔ Помощь', 'help')],
-            [btn('Контент-план', 'feat_plan')], [btn('ТГ-приложение', 'tg_app', style='primary')]]
+    rows = [[btn('Создать пост', 'new')],
+            [btn('Мои посты', 'posts'), btn('Контент-план', 'feat_plan')],
+            [btn('Маркетолог', 'marketer'), btn('Документы', 'knowledge')],
+            [btn('Компания', 'profile'), btn('Настройки', 'settings')]]
     if context(chat).get('mode') in ('task', 'planning', 'plan_retry') or context(chat).get('retry_instruction'):
         if not is_busy(chat):
             rows.insert(0, [btn('↻ Повторить задачу', 'retry')])
@@ -554,8 +582,11 @@ def home(chat):
             'Превратим идею в публикацию. Расскажите о событии текстом или голосом, добавьте своё фото.\n\n'
             '<b>Посты</b> · тексты, оформление и правки\n'
             '<b>Контент-план</b> · темы на нужный период\n'
-            '<b>Компания</b> · профиль и знания с сайта\n\n'
+            '<b>Маркетолог</b> · идеи, память и контент-план\n'
+            '<b>Документы</b> · знания компании из файлов и сайта\n\n'
             'Режим: <b>' + ('Быстрый' if bot_features.preferences(chat)['fast'] else 'Подробный') + '</b>')
+    import model_selection
+    text+='\nМодель: <b>'+escape(model_selection.title(model_selection.model_for(chat)))+'</b>'
     if is_busy(chat):
         text += '\n\nЗадача в работе.'
     say(chat, text, inline=rows, formatted=True, stage='home')
@@ -590,7 +621,7 @@ def navigation(chat, data):
             return say(chat, 'Сначала завершите правки поста.', inline=[[btn('← К правкам', 'stop_edit')]])
         nonce = secrets.token_hex(5)
         set_context(chat, {**pending, 'reset_nonce': nonce})
-        return say(chat, 'Сбросить компанию?\nАнкета и текущая задача будут очищены. Посты останутся.',
+        return say(chat, 'Сбросить компанию?\nАнкета, документы, память маркетолога и текущая задача будут очищены. Посты останутся.',
                    inline=[[btn('Да, сбросить', 'company_reset_confirm:' + nonce, style='danger')], [btn('← Не сбрасывать', 'settings')]])
     if data.startswith('company_reset_confirm:'):
         if not pending.get('reset_nonce') or data.split(':', 1)[1] != pending['reset_nonce']:
@@ -601,6 +632,11 @@ def navigation(chat, data):
             con.execute('DELETE FROM bot_confirmations WHERE chat=?', (chat,))
             con.execute('DELETE FROM bot_post_focus WHERE chat=?', (chat,))
             con.execute('DELETE FROM bot_company_knowledge WHERE chat=?', (chat,))
+            con.execute('DELETE FROM company_document_chunks WHERE document IN (SELECT id FROM company_documents WHERE chat=?)',(chat,))
+            con.execute('DELETE FROM company_documents WHERE chat=?',(chat,))
+            con.execute('DELETE FROM marketer_memory WHERE chat=?',(chat,))
+            con.execute('DELETE FROM bot_plan_context WHERE chat=?',(chat,))
+            con.execute('DELETE FROM marketer_messages WHERE chat=?',(chat,))
             con.execute('DELETE FROM bot_content_plans WHERE chat=?', (chat,))
             con.execute('DELETE FROM bot_feature_confirmations WHERE chat=?', (chat,))
         return ask(session(chat))
@@ -836,6 +872,7 @@ def create_posts(chat, task, clarification='', *, angle=''):
 
 
 def message(chat, text):
+    if text.split('@')[0]=='/project':return project_handoff(chat)
     with app.db() as con:
         con.execute('DELETE FROM bot_confirmations WHERE chat=?', (chat,))
     state = session(chat)
@@ -847,6 +884,10 @@ def message(chat, text):
             raise ValueError('Пост не найден.')
         return callback(chat, f'view:{linked["id"]}:{linked["rev"]}')
     pending = context(chat)
+    if pending.get('mode')=='marketer' and not text.startswith('/'):
+        with loading(chat,'Маркетолог готовит ответ') as wait:result=__import__('marketer').ask(chat,text)
+        if wait.visible:return say(chat,result['answer'],inline=[[btn('Контент-план','feat_plan'),btn('Документы','knowledge')],[btn('В меню','home')]],formatted=True)
+        return
     if pending.get('mode')=='image_edit' and not text.startswith('/'):
         import post_images
         with loading(chat,'Создаю новый вариант изображения') as wait:
@@ -1093,6 +1134,7 @@ def _handle(update):
         if query:
             acknowledge(query['id'], 'Нет доступа')
         return
+    __import__('user_access').observe(sender)
     processed = False
     try:
         import premium_emoji
@@ -1112,10 +1154,12 @@ def _handle(update):
             message(chat['id'], msg['text'].strip())
         elif msg.get('voice'):
             voice_message(chat['id'], msg['voice'])
+        elif msg.get('document'):
+            __import__('marketer').receive_document(chat['id'],msg['document'])
         elif msg.get('photo'):
             bot_features.receive_photo(chat['id'], msg['photo'])
         else:
-            say(chat['id'], 'Пока принимаю текстовые ответы. Документы и изображения добавим следующим этапом.')
+            say(chat['id'], 'Пришлите текст, голосовое, фото или документ PDF, DOCX, TXT.')
         processed = True
     except ValueError as error:
         pending = context(chat['id'])
@@ -1277,6 +1321,17 @@ def main():
         except Exception:
             print('Telegram connection error. Retrying in 5 seconds. No tokens logged.')
             time.sleep(5)
+
+
+
+
+def project_handoff(chat):
+    if str(chat) not in allowed_user_ids():raise PermissionError('Нет доступа.')
+    source=app.ROOT/'docs'/'PROJECT_HANDOFF_RU.md'
+    if not source.is_file():raise ValueError('Документ проекта пока не найден.')
+    path=app.ROOT/'data'/'PROJECT_HANDOFF_RU.txt'
+    path.write_text(source.read_text(encoding='utf-8'),encoding='utf-8-sig')
+    return tg('sendDocument',{'chat_id':chat,'_document_path':str(path),'caption':'Функционал проекта для презентации: возможности, демонстрация, архитектура и ограничения. Версия от 15 ноября 2026.'})
 
 
 if __name__ == '__main__':

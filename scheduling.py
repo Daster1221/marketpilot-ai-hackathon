@@ -78,7 +78,7 @@ def tick(now=None):
     try:
         image=bot_features.image_for(p['id'])
         import premium_emoji
-        pages=post_format.split_pages(premium_emoji.remove_emoji(p['body']),limit=1000 if image else 4096,formatted=True)
+        pages=post_format.split_pages(premium_emoji.render_publication(p['body'],item['chat'],item['channel']),limit=1000 if image else 4096,formatted=True)
         first=None
         for index,page in enumerate(pages):
             payload={'chat_id':item['channel'],'parse_mode':'HTML'}

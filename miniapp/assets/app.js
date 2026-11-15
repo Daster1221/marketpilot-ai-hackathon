@@ -144,7 +144,7 @@ function icon(name) {
 }
 
 const tabs = [
-  ["work", "home", "Главная"], ["chat", "chat", "Чат с ИИ"], ["plan", "calendar", "План"], ["profile", "profile", "Профиль"],
+  ["work", "home", "Главная"], ["chat", "chat", "Маркетолог"], ["plan", "calendar", "План"], ["profile", "profile", "Профиль"],
 ];
 dock.querySelector(".tabs").innerHTML = tabs.map(([key, symbol, label]) =>
   `<button type="button" data-tab="${key}">${icon(symbol)}${label}</button>`
@@ -258,6 +258,7 @@ function showWork() {
   return `<div class="dashboard">
     ${brandHeader(true)}
     <header class="greeting"><h1>Обзор</h1><p class="muted">Создавайте публикации вместе<br>с ИИ-агентом</p></header>
+    <button class="button secondary marketer-home" data-section="marketer">Маркетолог и документы →</button>
     ${demo ? `<section class="ai-panel design-task"><h2>О чём будет пост?</h2>${aiForm()}<button class="button primary" type="submit" form="ai-form">Создать с ИИ →</button></section>` : homeComposer()}
     <button type="button" class="panel row review-row" data-filter="${demo ? "review" : "all"}">
       ${icon("layers")}<span class="row-copy"><strong>${demo ? "На согласовании" : "Мои посты"}</strong><small>${label}</small></span>
@@ -286,6 +287,7 @@ function showProfile() {
     <div class="panel profile-user"><span class="avatar">${escapeHTML(Array.from(name)[0])}</span><span class="row-copy"><strong>${escapeHTML(name)}</strong><small>SMM-менеджер</small></span></div>
     <div class="panel">
       ${profileRow("Компания", "Салаватстекло", "company", "building")}
+      ${profileRow("Маркетолог и документы", "Память, знания и контент-план", "marketer", "file")}
       ${profileRow("Настройки AI", "Модель, стиль, тон", "settings", "settings")}
       ${profileRow("Публикации", "Подключённые площадки", "channels", "calendar")}
       <label class="row notification-row">${icon("bell")}<span class="row-copy"><strong>Уведомления</strong>
@@ -308,7 +310,7 @@ function showCompany() {
 
 function showSettings() {
   const profile = state.data.profile;
-  return heading("Настройки AI", {back: true}) + `<form id="profile-form">
+  return heading("Настройки", {back: true}) + `${profile.can_manage_users?'<button type="button" class="panel row" data-section="users"><span class="row-copy"><strong>Пользователи и доступ</strong><small>Добавить пользователя, посмотреть ники</small></span>›</button>':""}<form id="profile-form">
     <fieldset class="model-options"><legend>Модель для ваших задач</legend>${(profile.model_options||[]).map(m=>`<label class="model-option"><input type="radio" name="model" value="${escapeHTML(m.id)}" ${profile.model===m.id?'checked':''}><span><strong>${escapeHTML(m.title)}</strong><small>${escapeHTML(m.description)}</small><small>${m.input_price} ₽ вход / ${m.output_price} ₽ выход за 1 млн токенов</small></span></label>`).join('')}</fieldset><p class="muted model-note">Выбор действует в боте и Mini App. Новый запрос использует выбранную модель. Баланс ProxyAPI общий; цена зависит от объёма текста и рассуждений.</p>
     ${[["audience", "Аудитория"], ["tone", "Стиль и тон"], ["goals", "Цели"]].map(([name, title]) =>
       `<label>${title}<textarea name="${name}" maxlength="600" rows="2">${escapeHTML(profile[name])}</textarea></label>`).join("")}
@@ -411,7 +413,7 @@ function syncNavigation() {
   createButton.hidden = state.screen !== "list";
   view.classList.toggle("chat-view", state.tab === "chat" && state.screen === "root");
   dock.querySelectorAll("[data-tab]").forEach(tab => {
-    if (tab.dataset.tab === state.tab) tab.setAttribute("aria-current", "page");
+    if (tab.dataset.tab === (state.screen === "marketer" ? "chat" : state.tab)) tab.setAttribute("aria-current", "page");
     else tab.removeAttribute("aria-current");
   });
   if (state.screen === "root") nativeBack?.hide();
@@ -420,7 +422,7 @@ function syncNavigation() {
 
 function render() {
   const sections = {
-    company: showCompany, settings: showSettings, channels: showChannels,
+    company: showCompany, settings: showSettings, channels: showChannels, marketer: showMarketer, users: showUsers,
     help: showHelp, about: showAbout, analytics: showAnalytics, sources: showSources,
   };
   syncNavigation();
@@ -522,7 +524,7 @@ document.addEventListener("click", event => {
   }
   if (button.dataset.tab) {
     state.tab = button.dataset.tab;
-    state.screen = "root";
+    state.screen = state.tab === "chat" ? "marketer" : "root";
     state.sections = [];
   } else if (button.dataset.section) {
     state.sections.push(state.screen);
@@ -725,7 +727,7 @@ async function start() {
     state.data = demo ? {
       posts: [...readPreview(), ...samplePosts()],
       counts: {published: 12, created: 15, scheduled: 2, failed: 0},
-      profile: {model: "Gemini", audience: "", tone: "", goals: "", accounts: [], notifications: true},
+      profile: {can_manage_users:true, model: "Gemini", audience: "", tone: "", goals: "", accounts: [], notifications: true},
       sources: sourcePages.map(([title, path]) => ({title, url: "https://salstek.ru/" + path})),
       timezone: "Asia/Yekaterinburg",
     } : await api("./data");
@@ -736,7 +738,14 @@ async function start() {
   if (!demo && state.data) {
     try {
       const saved=savedLiveJob();
-      if(saved?.id||saved?.key){liveFlow.busy=true;liveFlow.task=saved.topic||"";liveFlow.workflow=saved.workflow;state.tab="chat";render();const result=await resumeLiveJob(saved);acceptLiveResult(result);await refreshLiveData();}
+      if(saved?.id||saved?.key){
+        if(['marketer','document','document_delete'].includes(saved.operation)){
+          state.screen='marketer';state.tab='chat';marketerUI.busy=true;render();
+          try{await resumeLiveJob(saved);marketerUI.loaded=false;await loadMarketer();marketerUI.notice='Результат предыдущей задачи восстановлен.';}
+          catch(error){marketerUI.error=error.message;}
+          finally{marketerUI.busy=false;}
+        }else{liveFlow.busy=true;liveFlow.task=saved.topic||"";liveFlow.workflow=saved.workflow;state.tab="chat";render();const result=await resumeLiveJob(saved);acceptLiveResult(result);await refreshLiveData();}
+      }
     }catch(error){liveFlow.error=error.message;}
     finally{liveFlow.busy=false;render();}
   }

@@ -55,7 +55,7 @@ def plain_emoji(body):
 
 def render_private(body,chat):
     import bot_features
-    body=plain_emoji(body)
+    body=post_format.normalize(plain_emoji(body))
     mapping=palette(chat) if bot_features.preferences(chat).get('premium_emoji',True) else {}
     if not mapping:return remove_emoji(body)
     class Renderer(post_format.PostParser):
@@ -70,7 +70,7 @@ def render_private(body,chat):
 
 
 def prompt_hint():
-    return '\nEMOJI POLICY: only use these optional glyphs from the verified nowemoji, IconsInTg and Salavatsteklo sets: '+', '.join(palette(None))+'. Company artwork takes priority when glyphs overlap. Do not use any other ordinary emoji. The bot converts these glyphs to real Premium entities; never write tg-emoji tags or IDs yourself. No mandatory emoji count. If no suitable symbol exists, use no emoji.'
+    return '\nEMOJI POLICY: only use these glyphs from the verified nowemoji, IconsInTg and Salavatsteklo sets: '+', '.join(palette(None))+'. Company artwork takes priority when glyphs overlap. Do not use any other ordinary emoji. The bot converts these glyphs to real Premium entities; never write tg-emoji tags or IDs yourself. For a normal editorial post, choose 1-3 context-relevant glyphs from this list, including one near the opening or key action. A sensitive or strictly technical notice may omit them. Never use square bullets or decorate every list item. If no suitable symbol exists, use no emoji.'
 
 
 def menu(chat):
@@ -79,7 +79,7 @@ def menu(chat):
     if previous.get('mode')!='emoji_palette':b.set_context(chat,{'mode':'emoji_palette','previous':previous})
     values=palette(chat)
     enabled=bot_features.preferences(chat).get('premium_emoji',True)
-    text='<b>Эмодзи для постов</b>\n\nnowemoji · IconsInTg · Salavatsteklo\n\nЕсли символ есть в нескольких наборах, выбираем фирменный. Посторонние эмодзи убираются.\n\nВ личке доступны Premium-эмодзи; в канале пока отправляем текст без них. Анимация работает в Telegram.'
+    text='<b>Эмодзи для постов</b>\n\nnowemoji · IconsInTg · Salavatsteklo\n\nЕсли символ есть в нескольких наборах, выбираем фирменный. Посторонние эмодзи убираются.\n\nВ личке и подключённой группе доступны Premium-эмодзи; в канале без Fragment отправляем текст без них. Анимация работает в Telegram.'
     return b.say(chat,text,inline=[[b.btn('В личке: '+('включено' if enabled else 'выключено'),'feat_emoji_toggle')],[b.btn('К настройкам','feat_emoji_close')]],formatted=True)
 
 
@@ -115,3 +115,12 @@ def receive(chat,msg):
     store(chat,stickers)
     menu(chat)
     return True
+
+
+def render_publication(body,owner,target):
+    """Premium only for the explicitly verified group; channels keep safe fallback."""
+    import os
+    group=os.environ.get('TELEGRAM_PREMIUM_GROUP_ID','').strip()
+    if group and str(target)==group:
+        return render_private(body,owner)
+    return remove_emoji(post_format.normalize(body))

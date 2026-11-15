@@ -12,7 +12,7 @@ import post_format
 import brand_visual
 import secrets, time
 
-MODEL = 'black-forest-labs/flux.2-max'
+MODEL = 'openai/gpt-image-2.6-flare'
 MAX_BYTES = 10_000_000
 RULES = ('Create the COMPLETE finished square social-media poster described below, '
          'including all specified Russian typography, panels, factual chips and graphic composition. '
@@ -70,7 +70,7 @@ def _refresh_cover(chat, post_id):
     if not p:return False
     folder=app.ROOT/'data'/'generated_images'
     decision=json.loads(review['decision']) if review else brand_visual.brief(p['topic'],p['body'])
-    if decision.get('director',{}).get('render_mode')=='generated_poster':
+    if decision.get('director',{}).get('render_mode') in ('generated_poster','directed_layout'):
         import hashlib
         if decision['director'].get('body_hash')!=hashlib.sha256(p['body'].encode()).hexdigest():
             decision['image_text_needs_review']=True
@@ -125,19 +125,29 @@ def decode_image(result):
 
 def generate_image(prompt,decision):
     """Use the customer's actual reference card when available, not just adjectives."""
-    reference=app.ROOT/'assets'/'visual-references'/('sports.png' if decision.get('content_type')=='sports' else 'recognition.png')
+    ref_name=decision.get('director',{}).get('reference') or ('sports' if decision.get('content_type')=='sports' else 'recognition')
+    folder=app.ROOT/'assets'/'visual-references'
+    reference=folder/(ref_name+'.jpg')
+    if not reference.is_file():reference=folder/(ref_name+'.png')
+    model=os.environ.get('IMAGE_MODEL',MODEL).strip() or MODEL
+    decision['image_model']=model
     if not reference.is_file():
-        return app.remote_json(app.ai_base_url()+'/images/generations',{'model':MODEL,'prompt':prompt,'n':1,'size':'1024x1024','response_format':'b64_json'},os.environ['DEEPSEEK_API_KEY'],timeout=180)
-    prompt=('The attached image is a STYLE AND LAYOUT reference only. Create ONE new poster for the brief below. '
-            'Borrow its typography/image balance, spacing and restrained corporate print-design quality. '
-            'Do not copy its text, dates, logos, awards or subject. No collage of multiple cards. '
-            'Avoid cinematic fire, orange glows, floating 3D ribbons and oversized stripe effects.\n'+prompt)
+        raise ValueError('Не найден визуальный референс. Платный запрос не отправлен.')
+    prompt=('Create a NEW complete designed social-media poster, using the attached full-resolution '
+            'artwork as the visual quality and art-direction reference. Match the designed density, '
+            'expressive type hierarchy, photographic depth, brush textures and carefully integrated '
+            'teal/white/yellow graphic elements. Adapt the scene and composition to the new subject. '
+            'This is a finished flat artwork, not a photograph of a poster or a design tutorial. '
+            'Replace ALL original lettering with ONLY the new exact copy below. Do not retain any '
+            'reference logo, emblem, dates, numbers, people identity or unrelated objects. '
+            'No logo, watermark, AI disclosure footer or empty logo placeholder. '
+            'Preserve Russian spelling and spaces between words. Keep all type inside safe margins.\n'+prompt)
     boundary='MarketPilotArt'+secrets.token_hex(16)
-    fields={'model':MODEL,'prompt':prompt,'size':'1024x1024','response_format':'b64_json'}
+    fields={'model':model,'prompt':prompt,'size':'1024x1024'}
     parts=[]
     for name,value in fields.items():
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode('utf-8'))
-    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="reference.png"\r\nContent-Type: image/png\r\n\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="reference{reference.suffix}"\r\nContent-Type: {"image/jpeg" if reference.suffix==".jpg" else "image/png"}\r\n\r\n'.encode())
     parts.extend([reference.read_bytes(),f'\r\n--{boundary}--\r\n'.encode()])
     request=urllib.request.Request(app.ai_base_url()+'/images/edits',b''.join(parts),{'Authorization':'Bearer '+os.environ['DEEPSEEK_API_KEY'],'Content-Type':'multipart/form-data; boundary='+boundary})
     with urllib.request.urlopen(request,timeout=180) as response:result=json.load(response)
@@ -178,14 +188,21 @@ def _generate(chat,post_id,*,instruction,key,replace=False,expected_rev=None):
         # One small, separately pinned DeepSeek call; no profile, chat or text history.
         director=art_director.plan(p['topic'],p['body'],instruction if replace else '',previous if replace else None)
         decision['director']=director
+        if director.get('render_mode')=='directed_layout':
+            decision['art_direction']=director['concept']
+            decision['layout']='directed_layout'
+            decision['preflight']=director['preflight']
         with app.db() as con:
             con.execute('UPDATE bot_visual_attempts SET decision=? WHERE key=?',(json.dumps(decision,ensure_ascii=False),key))
             # Do not pay FLUX if the text/photo was already changed during planning.
             current=con.execute('SELECT rev,body,topic FROM bot_posts WHERE id=? AND chat=? AND status IN ("draft","approved")',(post_id,chat)).fetchone()
             if not current or current['rev']!=p['rev'] or current['body']!=p['body'] or current['topic']!=p['topic']:
                 con.execute('UPDATE bot_visual_attempts SET state="superseded" WHERE key=?',(key,));return False
-        prompt=RULES+'\n'+director['prompt']
-        if director.get('texts'):prompt+='\nEXACT TEXT TO PRINT:\n'+json.dumps(director['texts'],ensure_ascii=False)
+        if director.get('render_mode')=='directed_layout':
+            prompt='Generate ONLY the visual scene, no letters, words, numbers, panels, logos or watermark. No mockup or poster inside the scene.\n'+director['prompt']
+        else:
+            prompt=RULES+'\n'+director['prompt']
+            if director.get('texts'):prompt+='\nEXACT TEXT TO PRINT:\n'+json.dumps(director['texts'],ensure_ascii=False)
         result=generate_image(prompt,decision)
         raw,suffix=decode_image(result)
         folder=app.ROOT/'data'/'generated_images';folder.mkdir(parents=True,exist_ok=True)

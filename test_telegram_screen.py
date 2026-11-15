@@ -91,6 +91,20 @@ class ScreenTests(unittest.TestCase):
         self.api.side_effect = ValueError('too old')
         screen.delete(42, 99, self.api)
 
+    def test_image_loading_uses_premium_without_model_names_or_seconds(self):
+        import model_selection
+        with patch.object(bot,'tg',self.api),patch.object(model_selection,'model_for',return_value='anthropic/claude-sonnet-5-5'):
+            wait=bot.loading(42,'Создаю изображение');wait.threaded=False
+            with wait:
+                first=screen.get(42)
+                text=json.loads(first['pages'])[0]
+                self.assertIn('emoji-id="5458724582187885302"',text)
+                self.assertNotIn('Claude',text);self.assertNotIn('gpt-image',text);self.assertNotIn('Текст:',text);self.assertNotIn('Изображение:',text)
+                self.assertTrue(wait.tick())
+                self.assertNotEqual(text,json.loads(screen.get(42)['pages'])[0])
+                screen.show(42,'Меню',[],False,self.api)
+                self.assertFalse(wait.tick())
+
     def test_loading_animates_and_stops_after_navigation(self):
         with screen.Loading(42, 'Готовлю черновик', self.api, threaded=False) as wait:
             first = self.api.call_args.args[1]['text']
@@ -194,3 +208,11 @@ class ScreenTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ProjectDocumentTests(unittest.TestCase):
+    def test_project_document_uses_dedicated_document_upload_field(self):
+        with patch.dict(app.os.environ,{'TELEGRAM_BOT_TOKEN':'fixture-not-real'}),patch.object(app,'remote_photo',return_value={'ok':True,'result':{'message_id':1}}) as upload:
+            bot.tg('sendDocument',{'chat_id':42,'_document_path':'safe-fixture.txt'})
+        self.assertEqual(upload.call_args.kwargs['field'],'document')
+        self.assertNotIn('_document_path',upload.call_args.args[1])

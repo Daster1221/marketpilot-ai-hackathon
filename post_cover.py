@@ -61,6 +61,11 @@ def render(raw,topic,body,decision):
     scene=ImageOps.fit(source.convert('RGB'),(1080,1080),method=Image.Resampling.LANCZOS)
     canvas=scene.convert('RGBA')
     director=decision.get('director',{})
+    if director.get('render_mode')=='directed_layout':
+        import creative_layout
+        result=creative_layout.render(raw,director)
+        decision.update(cover={'texts':director['texts'],'render_mode':'directed_layout'},cover_rendered=True,project_logo_applied=False,final_brand_compliance_verified=False)
+        return result
     if director.get('render_mode')=='generated_poster':
         # FLUX already designed all typography. Add only the existing logo asset.
         logo_used=add_logo(canvas)

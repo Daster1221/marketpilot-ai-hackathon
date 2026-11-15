@@ -28,8 +28,8 @@ class EditorialTests(unittest.TestCase):
             result = app.prepare_posts('Компания Салаватстекло', '15 октября играем в волейбол.')
         system, data = ai.call_args.args
         self.assertIn('style_reference_not_facts', system)
-        self.assertIn('Может оказаться, что человек', system)
-        self.assertNotIn('Может оказаться, что человек', str(data))
+        self.assertIn('Собирайте команды: впереди первенство', system)
+        self.assertNotIn('Собирайте команды: впереди первенство', str(data))
         self.assertNotIn('🏐', result['posts'][0]['body'])
         self.assertNotIn('ПЛС', result['posts'][0]['body'])
         self.assertEqual(editorial_voice.company_instruction('Пекарня', 'Пост о хлебе'), '')
@@ -38,7 +38,7 @@ class EditorialTests(unittest.TestCase):
         body = '<b>👩‍🔧 Наш коллега</b>\nИнтервью с сотрудником.'
         with patch.object(app, 'ai_json', return_value={'body': body, 'memory': ''}) as ai:
             result = app.rewrite_post('Салаватстекло', body, 'Сделай теплее')
-        self.assertIn('ПРОФИЛЬ КАНАЛА', ai.call_args.args[0])
+        self.assertIn('Внутренний канал Салаватстекло', ai.call_args.args[0])
         self.assertNotIn('👩‍🔧', result['body'])
 
     def test_current_style_preserves_spoilers_tags_and_punctuation(self):
@@ -172,8 +172,8 @@ class EditorialTests(unittest.TestCase):
         with patch.object(app, 'ai_json', return_value=response) as ai:
             app.prepare_posts('', 'Один пост: обучение завершили 37 сотрудников из пяти подразделений.')
         system, data = ai.call_args.args
-        self.assertIn('ВЫМЫШЛЕННЫЕ учебные примеры', system)
-        self.assertIn('Не превращай каждый пост в анкету', system)
+        self.assertIn('Примеры показывают стиль и ритм, НЕ факты', system)
+        self.assertIn('Не копируй формулировки и структуру механически', system)
         self.assertIn('37 сотрудников', data['task'])
         self.assertNotIn('training_facts_only', data)
         text, notes = editorial.clean_body('<b>Встреча</b>\n<blockquote>Мы **работаем** вместе.</blockquote>', 'Мы работаем вместе.')

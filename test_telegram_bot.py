@@ -135,9 +135,9 @@ class TelegramTests(unittest.TestCase):
         with patch.object(bot, 'say') as show:
             bot.home(42)
         rows = show.call_args.kwargs['inline']
-        self.assertEqual([len(row) for row in rows], [1, 2, 2, 1, 1])
+        self.assertEqual([len(row) for row in rows], [1, 2, 2, 2])
         self.assertEqual(rows[0][0]['callback_data'], 'new')
-        self.assertEqual(rows[-1][0]['style'], 'primary')
+        self.assertFalse(any(button.get('callback_data')=='tg_app' or button.get('web_app') for row in rows for button in row))
         with patch.object(bot, 'say') as show:
             bot.callback(42, 'tg_app')
             show.assert_not_called()

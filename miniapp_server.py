@@ -36,6 +36,8 @@ class Handler(BaseHTTPRequestHandler):
                     raw,mime=api.image(chat,int(path[13:]))
                     self.send_response(200);self.send_header('Content-Type',mime);self.send_header('Content-Length',str(len(raw)));self.send_header('Cache-Control','no-store, private');self.end_headers();self.wfile.write(raw);return
                 if path=='/data': result=api.data(chat)
+                elif path=='/users':result=__import__('user_access').listing(chat)
+                elif path=='/knowledge':result=__import__('marketer').snapshot(chat)
                 elif path=='/last-transcript': result=api.last_transcript(chat)
                 elif path.startswith('/job-requests/'): result=api.job_request(chat,path.removeprefix('/job-requests/'))
                 elif path.startswith('/posts/') and path[7:].isdigit(): result=api.serialize(api.post(chat,int(path[7:])))
@@ -46,6 +48,12 @@ class Handler(BaseHTTPRequestHandler):
                 origin=self.headers.get('Origin','')
                 if not api.origin_allowed(origin,self.headers.get('Host','')):
                     raise PermissionError('Запрос с другого сайта отклонён.')
+                if method=='POST' and path=='/documents':
+                    size=int(self.headers.get('Content-Length','0'))
+                    if not 1<=size<=5*1024*1024:raise ValueError('Документ должен быть не больше 5 МБ.')
+                    raw=self.rfile.read(size)
+                    if len(raw)!=size:raise ValueError('Загрузка документа прервана.')
+                    return self.api_response(200,api.enqueue(chat,{'operation':'document','document':raw,'filename':unquote(self.headers.get('X-Filename','document')),'request_id':self.headers.get('X-Request-ID','')}))
                 if method=='POST' and path=='/transcribe':
                     size=int(self.headers.get('Content-Length','0'))
                     if not 1<=size<=5*1024*1024: raise ValueError('Запись должна быть не больше 5 МБ.')
@@ -60,7 +68,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not 1<=size<=32000: raise ValueError('Слишком большой запрос.')
                 body=json.loads(self.rfile.read(size))
                 if not isinstance(body,dict): raise ValueError('Некорректный запрос.')
-                if method=='POST' and path=='/workflow': result=api.enqueue(chat,body)
+                if method=='POST' and path=='/users':
+                    import user_access,telegram_bot as b
+                    if body.get('action')=='remove':user_access.revoke(chat,body.get('user_id'))
+                    else:
+                        uid=user_access.grant(chat,body.get('user_id',''))
+                        try:
+                            profile=b.tg('getChat',{'chat_id':uid});user_access.observe({'id':uid,**{k:profile.get(k,'') for k in ('username','first_name','last_name')}})
+                        except ValueError:pass
+                    result=user_access.listing(chat)
+                elif method=='POST' and path=='/workflow': result=api.enqueue(chat,body)
                 elif method=='PATCH' and path.startswith('/posts/') and path[7:].isdigit(): result=api.save_post(chat,int(path[7:]),body)
                 elif method=='PATCH' and path=='/data':
                     import telegram_bot as b
@@ -89,7 +106,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path=urlsplit(self.path).path
-        if path in ('/data','/last-transcript') or path.startswith(('/posts/','/jobs/','/post-images/','/job-requests/')):
+        if path in ('/data','/last-transcript','/knowledge','/users') or path.startswith(('/posts/','/jobs/','/post-images/','/job-requests/')):
             return self.handle_api('GET')
         try:
             name = unquote(urlsplit(self.path).path).lstrip('/') or 'index.html'

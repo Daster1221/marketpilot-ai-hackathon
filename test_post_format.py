@@ -50,3 +50,13 @@ class FormatTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ListMarkerRegressionTests(unittest.TestCase):
+    def test_black_square_markers_become_plain_bullets_without_losing_text(self):
+        for marker in ('■','▪','◼','◾','⬛','◾️'):
+            body='<b>Возможности</b>\n'+marker+' График\n'+marker+' Выплаты'
+            normalized=post_format.layout(body)
+            self.assertIn('• График\n• Выплаты',normalized)
+            self.assertNotIn(marker,normalized)
+            self.assertEqual(post_format.layout(normalized),normalized)

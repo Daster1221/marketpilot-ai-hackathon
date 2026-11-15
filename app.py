@@ -63,8 +63,9 @@ def remote_json(url, payload, token=None, timeout=60):
         return json.load(response)
 
 
-def remote_photo(url, payload, path, timeout=20):
+def remote_photo(url, payload, path, timeout=20, field="photo"):
     """Upload a local UI asset without making it publicly accessible."""
+    if field not in ('photo','document'):raise ValueError('Unsupported upload field')
     import secrets
     boundary = 'MarketPilot' + secrets.token_hex(16)
     parts = []
@@ -73,7 +74,7 @@ def remote_photo(url, payload, path, timeout=20):
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode('utf-8'))
     import mimetypes
     content_type = mimetypes.guess_type(str(path))[0] or 'application/octet-stream'
-    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="photo"; filename="{Path(path).name}"\r\nContent-Type: {content_type}\r\n\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{Path(path).name}"\r\nContent-Type: {content_type}\r\n\r\n'.encode())
     parts.extend([Path(path).read_bytes(), f'\r\n--{boundary}--\r\n'.encode()])
     req = urllib.request.Request(url, b''.join(parts), {'Content-Type': 'multipart/form-data; boundary=' + boundary})
     with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -137,9 +138,26 @@ def generate(brief):
     return posts, 'deepseek'
 
 
+def parse_ai_object(content):
+    """Accept a complete object or one fenced JSON object, never partial repairs."""
+    if not isinstance(content,str):raise ValueError('AI не вернул текст ответа.')
+    try:value=json.loads(content)
+    except json.JSONDecodeError:
+        import re
+        candidates=[]
+        for block in re.findall(r'```(?:json)?\s*\n?(.*?)```',content,flags=re.S|re.I):
+            try:item=json.loads(block.strip())
+            except json.JSONDecodeError:continue
+            if isinstance(item,dict):candidates.append(item)
+        if len(candidates)!=1:raise ValueError('AI вернул некорректный формат. Ваш текст сохранён; повторите запрос.') from None
+        value=candidates[0]
+    if not isinstance(value,dict):raise ValueError('AI вернул некорректную структуру ответа.')
+    return value
+
+
 def ai_json(system, data):
     import premium_emoji
-    system+=premium_emoji.prompt_hint()
+    system+=premium_emoji.prompt_hint()+'\nOUTPUT CONTRACT: return exactly one valid JSON object. No prose before/after it, no Markdown code fences.'
     key = os.environ.get('DEEPSEEK_API_KEY')
     if not key:
         raise ValueError('Для задач и AI-правок нужен ключ в .env. Сейчас доступен только шаблонный деморежим.')
@@ -154,7 +172,7 @@ def ai_json(system, data):
         choice = result['choices'][0]
         if choice.get('finish_reason') == 'length':
             raise ValueError('Ответ AI обрезан. Сократите запрос и попробуйте ещё раз.')
-        value = json.loads(choice['message']['content'])
+        value = parse_ai_object(choice['message']['content'])
         if not isinstance(value, dict):
             raise TypeError
         return value
