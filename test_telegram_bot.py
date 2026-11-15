@@ -356,7 +356,7 @@ class TelegramTests(unittest.TestCase):
     def test_post_buttons_have_two_clear_rows(self):
         with app.db() as con:
             con.execute('INSERT INTO bot_posts(chat,topic,body,source) VALUES(42,"Тема","Текст","demo")')
-        bot.show_post(42, 1)
+        with patch.dict(app.os.environ,{'VK_ACCESS_TOKEN':''}):bot.show_post(42, 1)
         markup = self.api_mock.call_args.args[1]['reply_markup']['inline_keyboard']
         self.assertEqual([len(row) for row in markup], [2, 1, 1, 2, 1, 2, 1])
         self.assertIn("запланировать", markup[2][0]["text"])

@@ -461,7 +461,7 @@ async function openPost(id, {saved = false} = {}) {
     const action = post.status === "PENDING_APPROVAL" ? "Проверить пост в боте" : "Открыть в боте";
     view.innerHTML = postHead(post) + confirmation +
       `<div id="post-image-slot"></div><article class="panel post-body">${safePostHTML(post.body_html || post.body || "В посте пока нет текста.")}</article>` +
-      (demo ? "" : `${["DRAFT","APPROVED","SCHEDULED","QUEUED"].includes(post.status)?`<button type="button" class="button primary" data-live-edit="${post.id}">Редактировать пост</button>`:""}<a class="button secondary" data-bot-link href="${botLink}?start=post_${id}">${action}</a>`);
+      (demo ? "" : `${vkControls(post)}${["DRAFT","APPROVED","SCHEDULED","QUEUED"].includes(post.status)?`<button type="button" class="button primary" data-live-edit="${post.id}">Редактировать пост</button>`:""}<a class="button secondary" data-bot-link href="${botLink}?start=post_${id}">${action}</a>`);
     if (!demo && post.has_image) {
      try{
       const imageResponse=await fetch('./post-images/'+id,{headers:{'X-Telegram-Init-Data':initData}});

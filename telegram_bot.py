@@ -353,6 +353,10 @@ def show_post(chat, post_id):
         buttons.append([btn('Прикрепить фото', 'feat_photo_help'), btn('Убрать фото', f'feat_image_remove:{post_id}:{post["rev"]}')])
     if post['status'] not in ('publishing','delivery_unknown'):
         buttons.append([btn('Удалить из моих постов', f'feat_delete:{post_id}:{post["rev"]}')])
+    if post['status'] in ('draft','approved','published') and __import__('vk_publish').configured(chat):
+        vk=__import__('vk_publish').status(chat,post_id)
+        if vk['state']=='sent':buttons.append([{'text':'Открыть пост в ВК','url':vk['url']}])
+        else:buttons.append([button('ВК · только текст','vk_preview')])
     body = post_format.normalize(post['body'])
     stage = 'published' if post['status'] == 'published' else ('edit' if session(chat)['editing'] == post_id else 'draft')
     return say(chat, body, inline=buttons, formatted=True, stage=stage, media=bot_features.image_for(post_id))
@@ -419,6 +423,7 @@ def preview(chat, post):
 
 
 def callback(chat, data):
+    if data.startswith(('vk_preview:', 'vk_confirm:')):return __import__('vk_publish').callback(chat,data)
     if data=='project_info':return project_handoff(chat)
     if data=='marketer':return __import__('marketer').menu(chat)
     if data=='knowledge':return __import__('marketer').documents_menu(chat)

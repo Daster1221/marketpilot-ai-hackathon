@@ -7,6 +7,7 @@ import app
 def init_db(con):
     import scheduling
     scheduling.init_db(con)
+    __import__('vk_publish').init_db(con)
     import premium_emoji
     premium_emoji.init_db(con)
     import post_images
@@ -197,13 +198,15 @@ def callback(chat, data):
             if not row or len(parts)!=2 or row['nonce']!=parts[1]:
                 raise ValueError('Подтверждение устарело.')
             for item in json.loads(row['data']):
+                vk=con.execute('SELECT state FROM bot_vk_delivery WHERE post=?',(item['id'],)).fetchone()
+                if vk and vk['state'] in ('sending','unknown'):raise ValueError('Сначала проверьте доставку этого поста в ВК. Удаление пока заблокировано.')
                 removed=con.execute('DELETE FROM bot_posts WHERE id=? AND chat=? AND rev=? AND status=?',(item['id'],chat,item['rev'],item['status'])).rowcount
                 if removed:
                     if con.execute("SELECT 1 FROM sqlite_master WHERE name='mini_edit_memory'").fetchone():
                         con.execute('DELETE FROM mini_edit_memory WHERE post=?',(item['id'],))
                     if con.execute("SELECT 1 FROM sqlite_master WHERE name='bot_post_schedule'").fetchone():
                         con.execute('DELETE FROM bot_post_schedule WHERE post=?',(item['id'],))
-                    for optional in ('bot_delivery_schedule','mini_edit_memory','bot_image_jobs','bot_visual_reviews','bot_visual_attempts'):
+                    for optional in ('bot_delivery_schedule','mini_edit_memory','bot_image_jobs','bot_visual_reviews','bot_visual_attempts','bot_vk_delivery'):
                         if con.execute('SELECT 1 FROM sqlite_master WHERE name=?',(optional,)).fetchone():
                             con.execute('DELETE FROM '+optional+' WHERE post=?',(item['id'],))
                     for table in ('bot_versions','bot_post_context','bot_post_review','bot_post_images','bot_confirmations','bot_post_focus'):

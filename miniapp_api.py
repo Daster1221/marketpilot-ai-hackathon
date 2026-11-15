@@ -100,6 +100,8 @@ def serialize(p,metadata=None,*,summary=False):
     if result['delivery_state']=='queued' and result['status']!='QUEUED':result['delivery_state']='needs_review'
     if not summary:
         import premium_emoji
+        result['vk_available']=__import__('vk_publish').configured(p['chat'])
+        result['vk_delivery']=__import__('vk_publish').status(p['chat'],p['id'])
         result.update(body=p['body'],body_html=premium_emoji.render_private(post_format.normalize(p['body']),p['chat']),warnings=json.loads(metadata.get('warnings') or '[]'))
         with app.db() as con:
             visual=con.execute('SELECT decision FROM bot_visual_reviews WHERE post=?',(p['id'],)).fetchone()
@@ -160,6 +162,11 @@ def workflow(chat,request):
 
 def _workflow(chat,request):
     operation=request.get('operation')
+    if operation in ('vk_preview','vk_publish'):
+        import vk_publish
+        pid=int(request.get('post_id',0));rev=request.get('rev')
+        if operation=='vk_preview':return {'vk_preview':vk_publish.prepare(chat,pid,rev)}
+        return {'vk_sent':vk_publish.publish(chat,pid,rev,request.get('nonce',''))}
     if operation=='marketer':return __import__('marketer').ask(chat,request.get('text',''))
     if operation=='document':return __import__('company_documents').ingest(chat,request.get('filename',''),request.get('document',b''))
     if operation=='document_delete':
